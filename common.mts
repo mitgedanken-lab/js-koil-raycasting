@@ -8,26 +8,6 @@ export const BOMB_GRAVITY = 10;
 export const BOMB_DAMP = 0.8;
 export const BOMB_SCALE = 0.25;
 
-export class RGBA {
-    r: number;
-    g: number;
-    b: number;
-    a: number;
-    constructor(r: number, g: number, b: number, a: number) {
-        this.r = r;
-        this.g = g;
-        this.b = b;
-        this.a = a;
-    }
-    toStyle(): string {
-        return `rgba(`
-            +`${Math.floor(this.r*255)}, `
-            +`${Math.floor(this.g*255)}, `
-            +`${Math.floor(this.b*255)}, `
-            +`${this.a})`;
-    }
-}
-
 export class Vector2 {
     x: number;
     y: number;
@@ -279,18 +259,6 @@ function allocUint8Field(allocator: { size: number }): Field {
     }
 }
 
-function allocUint16Field(allocator: { size: number }): Field {
-    const offset = allocator.size;
-    const size = UINT16_SIZE;
-    allocator.size += size;
-    return {
-        offset,
-        size,
-        read: (view) => view.getUint16(offset),
-        write: (view, value) => view.setUint16(offset, value)
-    }
-}
-
 function allocUint32Field(allocator: { size: number }): Field {
     const offset = allocator.size;
     const size = UINT32_SIZE;
@@ -498,7 +466,7 @@ export function clamp(value: number, min: number, max: number) {
 }
 
 export interface Scene {
-    walls: Array<boolean>;
+    wallsPtr: number;
     width: number;
     height: number;
 }
@@ -507,19 +475,20 @@ export function sceneContains(scene: Scene, p: Vector2): boolean {
     return 0 <= p.x && p.x < scene.width && 0 <= p.y && p.y < scene.height;
 }
 
-export function sceneGetTile(scene: Scene, p: Vector2): boolean {
+export function sceneGetTile(walls: Uint8ClampedArray, scene: Scene, p: Vector2): boolean {
     if (!sceneContains(scene, p)) return false;
-    return scene.walls[Math.floor(p.y)*scene.width + Math.floor(p.x)];
+    return walls[Math.floor(p.y)*scene.width + Math.floor(p.x)] !== 0;
 }
 
-export function sceneCanRectangleFitHere(scene: Scene, px: number, py: number, sx: number, sy: number): boolean {
+export function sceneCanRectangleFitHere(wasmCommon: WasmCommon, scene: Scene, px: number, py: number, sx: number, sy: number): boolean {
     const x1 = Math.floor(px - sx*0.5);
     const x2 = Math.floor(px + sx*0.5);
     const y1 = Math.floor(py - sy*0.5);
     const y2 = Math.floor(py + sy*0.5);
+    const walls = new Uint8ClampedArray(wasmCommon.memory.buffer, scene.wallsPtr, scene.width*scene.height);
     for (let x = x1; x <= x2; ++x) {
         for (let y = y1; y <= y2; ++y) {
-            if (sceneGetTile(scene, new Vector2(x, y))) {
+            if (sceneGetTile(walls, scene, new Vector2(x, y))) {
                 return false;
             }
         }
@@ -527,19 +496,27 @@ export function sceneCanRectangleFitHere(scene: Scene, px: number, py: number, s
     return true;
 }
 
-export function createScene(walls: Array<Array<boolean>>): Scene {
+export interface WasmCommon {
+    wasm: WebAssembly.WebAssemblyInstantiatedSource,
+    memory: WebAssembly.Memory,
+    _initialize: () => void,
+    allocate_scene: (width: number, height: number) => number,
+}
+
+export function createScene(walls: Array<Array<boolean>>, wasmCommon: WasmCommon): Scene {
     const scene: Scene = {
         height: walls.length,
         width: Number.MIN_VALUE,
-        walls: [],
+        wallsPtr: 0,
     };
     for (let row of walls) {
         scene.width = Math.max(scene.width, row.length);
     }
-    for (let row of walls) {
-        scene.walls = scene.walls.concat(row);
-        for (let i = 0; i < scene.width - row.length; ++i) {
-            scene.walls.push(false);
+    scene.wallsPtr = wasmCommon.allocate_scene(scene.width, scene.height);
+    const wallsData = new Uint8ClampedArray(wasmCommon.memory.buffer, scene.wallsPtr, scene.width*scene.height);
+    for (let y = 0; y < walls.length; ++y) {
+        for (let x = 0; x < walls[y].length; ++x) {
+            wallsData[y*scene.width + x] = Number(walls[y][x]);
         }
     }
     return scene;
@@ -600,14 +577,15 @@ export function throwBomb(player: Player, bombs: Array<Bomb>): number | null {
     return null;
 }
 
-export function updateBomb(bomb: Bomb, scene: Scene, deltaTime: number): boolean {
+export function updateBomb(wasmCommon: WasmCommon, bomb: Bomb, scene: Scene, deltaTime: number): boolean {
     let collided = false;
     bomb.lifetime -= deltaTime;
     bomb.velocity.z -= BOMB_GRAVITY*deltaTime;
 
     const nx = bomb.position.x + bomb.velocity.x*deltaTime;
     const ny = bomb.position.y + bomb.velocity.y*deltaTime;
-    if (sceneGetTile(scene, new Vector2(nx, ny))) {
+    const walls = new Uint8ClampedArray(wasmCommon.memory.buffer, scene.wallsPtr, scene.width*scene.height);
+    if (sceneGetTile(walls, scene, new Vector2(nx, ny))) {
         const dx = Math.abs(Math.floor(bomb.position.x) - Math.floor(nx));
         const dy = Math.abs(Math.floor(bomb.position.y) - Math.floor(ny));
         
@@ -639,7 +617,7 @@ export interface Level {
     bombs: Array<Bomb>,
 }
 
-export function createLevel(): Level {
+export function createLevel(wasmCommon: WasmCommon): Level {
     const scene = createScene([
         [ false, false, true, true, true, false, false],
         [ false, false, false, false, false, true, false],
@@ -648,7 +626,7 @@ export function createLevel(): Level {
         [ true],
         [  false,  true, true, true, false, false, false],
         [  false,  false, false, false, false, false, false],
-    ]);
+    ], wasmCommon);
 
     const items: Array<Item> = [
         {
@@ -688,7 +666,7 @@ export function createLevel(): Level {
     return {scene, items, bombs};
 }
 
-export function updatePlayer(player: Player, scene: Scene, deltaTime: number) {
+export function updatePlayer(wasmCommon: WasmCommon, player: Player, scene: Scene, deltaTime: number) {
     const controlVelocity = new Vector2();
     let angularVelocity = 0.0;
     if ((player.moving>>Moving.MovingForward)&1) {
@@ -706,11 +684,26 @@ export function updatePlayer(player: Player, scene: Scene, deltaTime: number) {
     player.direction = player.direction + angularVelocity*deltaTime;
 
     const nx = player.position.x + controlVelocity.x*deltaTime;
-    if (sceneCanRectangleFitHere(scene, nx, player.position.y, PLAYER_SIZE, PLAYER_SIZE)) {
+    if (sceneCanRectangleFitHere(wasmCommon, scene, nx, player.position.y, PLAYER_SIZE, PLAYER_SIZE)) {
         player.position.x = nx;
     }
     const ny = player.position.y + controlVelocity.y*deltaTime;
-    if (sceneCanRectangleFitHere(scene, player.position.x, ny, PLAYER_SIZE, PLAYER_SIZE)) {
+    if (sceneCanRectangleFitHere(wasmCommon, scene, player.position.x, ny, PLAYER_SIZE, PLAYER_SIZE)) {
         player.position.y = ny;
     }
+}
+
+export function make_environment(...envs: any): any {
+    return new Proxy(envs, {
+        get(_target, prop, _receiver) {
+            for (let env of envs) {
+                if (env.hasOwnProperty(prop)) {
+                    return env[prop];
+                }
+            }
+            return (...args: any) => {
+                throw new Error(`NOT IMPLEMENTED: ${String(prop)} ${args}`)
+            }
+        }
+    });
 }

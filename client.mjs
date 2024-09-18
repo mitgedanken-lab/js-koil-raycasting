@@ -1,28 +1,14 @@
 import * as common from './common.mjs';
-import { RGBA, Vector2, Vector3, sceneGetTile, updatePlayer, PLAYER_SIZE, SERVER_PORT, clamp, properMod } from './common.mjs';
-const EPS = 1e-6;
+import { Vector2, updatePlayer, SERVER_PORT, clamp, properMod } from './common.mjs';
 const NEAR_CLIPPING_PLANE = 0.1;
-const FAR_CLIPPING_PLANE = 10.0;
 const FOV = Math.PI * 0.5;
 const SCREEN_FACTOR = 30;
 const SCREEN_WIDTH = Math.floor(16 * SCREEN_FACTOR);
 const SCREEN_HEIGHT = Math.floor(9 * SCREEN_FACTOR);
-const SCENE_FLOOR1 = new RGBA(0.094, 0.094 + 0.07, 0.094 + 0.07, 1.0);
-const SCENE_FLOOR2 = new RGBA(0.188, 0.188 + 0.07, 0.188 + 0.07, 1.0);
-const SCENE_CEILING1 = new RGBA(0.094 + 0.07, 0.094, 0.094, 1.0);
-const SCENE_CEILING2 = new RGBA(0.188 + 0.07, 0.188, 0.188, 1.0);
 const ITEM_FREQ = 0.7;
 const ITEM_AMP = 0.07;
 const BOMB_PARTICLE_COUNT = 50;
-const PARTICLE_LIFETIME = 1.0;
-const PARTICLE_DAMP = 0.8;
-const PARTICLE_SCALE = 0.05;
-const PARTICLE_MAX_SPEED = 8;
-const PARTICLE_COLOR = new RGBA(1, 0.5, 0.15, 1);
 const MINIMAP = false;
-const MINIMAP_SPRITES = true;
-const MINIMAP_SPRITE_SIZE = 0.2;
-const MINIMAP_SCALE = 0.07;
 const SPRITE_ANGLES_COUNT = 8;
 const CONTROL_KEYS = {
     'ArrowLeft': common.Moving.TurningLeft,
@@ -34,135 +20,12 @@ const CONTROL_KEYS = {
     'KeyW': common.Moving.MovingForward,
     'KeyS': common.Moving.MovingBackward,
 };
-function createSpritePool() {
-    return {
-        items: [],
-        length: 0,
-    };
+function createSpritePool(wasmClient) {
+    const ptr = wasmClient.allocate_sprite_pool();
+    return { ptr };
 }
-function resetSpritePool(spritePool) {
-    spritePool.length = 0;
-}
-function strokeLine(ctx, p1, p2) {
-    ctx.beginPath();
-    ctx.moveTo(p1.x, p1.y);
-    ctx.lineTo(p2.x, p2.y);
-    ctx.stroke();
-}
-function snap(x, dx) {
-    if (dx > 0)
-        return Math.ceil(x + Math.sign(dx) * EPS);
-    if (dx < 0)
-        return Math.floor(x + Math.sign(dx) * EPS);
-    return x;
-}
-function hittingCell(p1, p2) {
-    const dx = p2.x - p1.x;
-    const dy = p2.y - p1.y;
-    return new Vector2(Math.floor(p2.x + Math.sign(dx) * EPS), Math.floor(p2.y + Math.sign(dy) * EPS));
-}
-function rayStep(p1, p2) {
-    let p3 = p2.clone();
-    const dx = p2.x - p1.x;
-    const dy = p2.y - p1.y;
-    if (dx !== 0) {
-        const k = dy / dx;
-        const c = p1.y - k * p1.x;
-        {
-            const x3 = snap(p2.x, dx);
-            const y3 = x3 * k + c;
-            p3.set(x3, y3);
-        }
-        if (k !== 0) {
-            const y3 = snap(p2.y, dy);
-            const x3 = (y3 - c) / k;
-            const p3t = new Vector2(x3, y3);
-            if (p2.sqrDistanceTo(p3t) < p2.sqrDistanceTo(p3)) {
-                p3.copy(p3t);
-            }
-        }
-    }
-    else {
-        const y3 = snap(p2.y, dy);
-        const x3 = p2.x;
-        p3.set(x3, y3);
-    }
-    return p3;
-}
-function sceneGetFloor(p) {
-    if ((Math.floor(p.x) + Math.floor(p.y)) % 2 == 0) {
-        return SCENE_FLOOR1;
-    }
-    else {
-        return SCENE_FLOOR2;
-    }
-}
-function sceneGetCeiling(p) {
-    if ((Math.floor(p.x) + Math.floor(p.y)) % 2 == 0) {
-        return SCENE_CEILING1;
-    }
-    else {
-        return SCENE_CEILING2;
-    }
-}
-function castRay(scene, p1, p2) {
-    let start = p1;
-    while (start.sqrDistanceTo(p1) < FAR_CLIPPING_PLANE * FAR_CLIPPING_PLANE) {
-        const c = hittingCell(p1, p2);
-        if (sceneGetTile(scene, c))
-            break;
-        const p3 = rayStep(p1, p2);
-        p1 = p2;
-        p2 = p3;
-    }
-    return p2;
-}
-function renderMinimap(ctx, camera, player, scene, spritePool, visibleSprites) {
-    ctx.save();
-    const p1 = new Vector2();
-    const p2 = new Vector2();
-    const cellSize = ctx.canvas.width * MINIMAP_SCALE;
-    ctx.translate(ctx.canvas.width * 0.03, ctx.canvas.height * 0.03);
-    ctx.scale(cellSize, cellSize);
-    ctx.fillStyle = "#181818";
-    ctx.fillRect(0, 0, scene.width, scene.height);
-    ctx.lineWidth = 0.05;
-    for (let y = 0; y < scene.height; ++y) {
-        for (let x = 0; x < scene.width; ++x) {
-            if (sceneGetTile(scene, p1.set(x, y))) {
-                ctx.fillStyle = "blue";
-                ctx.fillRect(x, y, 1, 1);
-            }
-        }
-    }
-    ctx.strokeStyle = "#303030";
-    for (let x = 0; x <= scene.width; ++x) {
-        strokeLine(ctx, p1.set(x, 0), p2.set(x, scene.height));
-    }
-    for (let y = 0; y <= scene.height; ++y) {
-        strokeLine(ctx, p1.set(0, y), p2.set(scene.width, y));
-    }
-    ctx.fillStyle = "magenta";
-    ctx.fillRect(player.position.x - PLAYER_SIZE * 0.5, player.position.y - PLAYER_SIZE * 0.5, PLAYER_SIZE, PLAYER_SIZE);
-    ctx.strokeStyle = "magenta";
-    strokeLine(ctx, camera.fovLeft, camera.fovRight);
-    strokeLine(ctx, camera.position, camera.fovLeft);
-    strokeLine(ctx, camera.position, camera.fovRight);
-    if (MINIMAP_SPRITES) {
-        ctx.strokeStyle = "yellow";
-        ctx.fillStyle = "white";
-        for (let i = 0; i < spritePool.length; ++i) {
-            const sprite = spritePool.items[i];
-            ctx.fillRect(sprite.position.x - MINIMAP_SPRITE_SIZE * 0.5, sprite.position.y - MINIMAP_SPRITE_SIZE * 0.5, MINIMAP_SPRITE_SIZE, MINIMAP_SPRITE_SIZE);
-        }
-        const sp = new Vector2();
-        for (let sprite of visibleSprites) {
-            strokeLine(ctx, player.position, sprite.position);
-            sp.copy(sprite.position).sub(player.position).norm().scale(sprite.dist).add(player.position);
-            ctx.fillRect(sp.x - MINIMAP_SPRITE_SIZE * 0.5, sp.y - MINIMAP_SPRITE_SIZE * 0.5, MINIMAP_SPRITE_SIZE, MINIMAP_SPRITE_SIZE);
-        }
-    }
-    ctx.restore();
+function renderMinimap(wasmClient, display, camera, player, scene, spritePool) {
+    wasmClient.render_minimap(display.minimap.ptr, display.minimap.width, display.minimap.height, camera.position.x, camera.position.y, camera.direction, player.position.x, player.position.y, scene.wallsPtr, scene.width, scene.height, spritePool.ptr);
 }
 function renderDebugInfo(ctx, deltaTime, game) {
     const fontSize = 28;
@@ -201,101 +64,13 @@ function renderDebugInfo(ctx, deltaTime, game) {
         ctx.fillText(labels[i], padding + shadowOffset, padding - shadowOffset + fontSize * i);
     }
 }
-function renderColumnOfWall(display, cell, x, p, c) {
-    if (cell instanceof RGBA) {
-        const stripHeight = display.backImageData.height / display.zBuffer[x];
-        const shadow = 1 / display.zBuffer[x] * 2;
-        for (let dy = 0; dy < Math.ceil(stripHeight); ++dy) {
-            const y = Math.floor((display.backImageData.height - stripHeight) * 0.5) + dy;
-            const destP = (y * display.backImageData.width + x) * 4;
-            display.backImageData.data[destP + 0] = cell.r * shadow * 255;
-            display.backImageData.data[destP + 1] = cell.g * shadow * 255;
-            display.backImageData.data[destP + 2] = cell.b * shadow * 255;
-        }
-    }
-    else if (cell instanceof ImageData) {
-        const stripHeight = display.backImageData.height / display.zBuffer[x];
-        let u = 0;
-        const t = p.clone().sub(c);
-        if (Math.abs(t.x) < EPS && t.y > 0) {
-            u = t.y;
-        }
-        else if (Math.abs(t.x - 1) < EPS && t.y > 0) {
-            u = 1 - t.y;
-        }
-        else if (Math.abs(t.y) < EPS && t.x > 0) {
-            u = 1 - t.x;
-        }
-        else {
-            u = t.x;
-        }
-        const y1f = (display.backImageData.height - stripHeight) * 0.5;
-        const y1 = Math.ceil(y1f);
-        const y2 = Math.floor(y1 + stripHeight);
-        const by1 = Math.max(0, y1);
-        const by2 = Math.min(display.backImageData.height, y2);
-        const tx = Math.floor(u * cell.width);
-        const sh = cell.height / stripHeight;
-        const shadow = Math.min(1 / display.zBuffer[x] * 4, 1);
-        for (let y = by1; y < by2; ++y) {
-            const ty = Math.floor((y - y1f) * sh);
-            const destP = (y * display.backImageData.width + x) * 4;
-            const srcP = (ty * cell.width + tx) * 4;
-            display.backImageData.data[destP + 0] = cell.data[srcP + 0] * shadow;
-            display.backImageData.data[destP + 1] = cell.data[srcP + 1] * shadow;
-            display.backImageData.data[destP + 2] = cell.data[srcP + 2] * shadow;
-        }
-    }
-}
-function renderWalls(display, assets, camera, scene) {
-    const d = new Vector2().setPolar(camera.direction);
-    for (let x = 0; x < display.backImageData.width; ++x) {
-        const p = castRay(scene, camera.position, camera.fovLeft.clone().lerp(camera.fovRight, x / display.backImageData.width));
-        const c = hittingCell(camera.position, p);
-        const v = p.clone().sub(camera.position);
-        display.zBuffer[x] = v.dot(d);
-        if (sceneGetTile(scene, c)) {
-            renderColumnOfWall(display, assets.wallImageData, x, p, c);
-        }
-    }
-}
-function renderFloorAndCeiling(imageData, camera) {
-    const pz = imageData.height / 2;
-    const t = new Vector2();
-    const t1 = new Vector2();
-    const t2 = new Vector2();
-    const bp = t1.copy(camera.fovLeft).sub(camera.position).length();
-    for (let y = Math.floor(imageData.height / 2); y < imageData.height; ++y) {
-        const sz = imageData.height - y - 1;
-        const ap = pz - sz;
-        const b = (bp / ap) * pz / NEAR_CLIPPING_PLANE;
-        t1.copy(camera.fovLeft).sub(camera.position).norm().scale(b).add(camera.position);
-        t2.copy(camera.fovRight).sub(camera.position).norm().scale(b).add(camera.position);
-        for (let x = 0; x < imageData.width; ++x) {
-            t.copy(t1).lerp(t2, x / imageData.width);
-            const floorTile = sceneGetFloor(t);
-            if (floorTile instanceof RGBA) {
-                const destP = (y * imageData.width + x) * 4;
-                const shadow = camera.position.distanceTo(t) * 255;
-                imageData.data[destP + 0] = floorTile.r * shadow;
-                imageData.data[destP + 1] = floorTile.g * shadow;
-                imageData.data[destP + 2] = floorTile.b * shadow;
-            }
-            const ceilingTile = sceneGetCeiling(t);
-            if (ceilingTile instanceof RGBA) {
-                const destP = (sz * imageData.width + x) * 4;
-                const shadow = camera.position.distanceTo(t) * 255;
-                imageData.data[destP + 0] = ceilingTile.r * shadow;
-                imageData.data[destP + 1] = ceilingTile.g * shadow;
-                imageData.data[destP + 2] = ceilingTile.b * shadow;
-            }
-        }
-    }
-}
-function createDisplay(ctx, width, height) {
-    const backImageData = new ImageData(width, height);
-    backImageData.data.fill(255);
-    const backCanvas = new OffscreenCanvas(width, height);
+function createDisplay(ctx, wasmClient, backImageWidth, backImageHeight) {
+    const minimapWidth = backImageWidth * 0.03;
+    const minimapHeight = backImageHeight * 0.03;
+    const minimapPtr = wasmClient.allocate_pixels(minimapWidth, minimapHeight);
+    const backImagePtr = wasmClient.allocate_pixels(backImageWidth, backImageHeight);
+    const zBufferPtr = wasmClient.allocate_zbuffer(backImageWidth);
+    const backCanvas = new OffscreenCanvas(backImageWidth, backImageHeight);
     const backCtx = backCanvas.getContext("2d");
     if (backCtx === null)
         throw new Error("2D context is not supported");
@@ -303,154 +78,60 @@ function createDisplay(ctx, width, height) {
     return {
         ctx,
         backCtx,
-        backImageData,
-        zBuffer: Array(width).fill(0),
+        backImage: {
+            ptr: backImagePtr,
+            width: backImageWidth,
+            height: backImageHeight,
+        },
+        minimap: {
+            ptr: minimapPtr,
+            width: minimapWidth,
+            height: minimapHeight,
+        },
+        zBufferPtr,
     };
 }
-function displaySwapBackImageData(display) {
-    display.backCtx.putImageData(display.backImageData, 0, 0);
+function displaySwapBackImageData(display, wasmClient) {
+    const backImageData = new Uint8ClampedArray(wasmClient.memory.buffer, display.backImage.ptr, display.backImage.width * display.backImage.height * 4);
+    display.backCtx.putImageData(new ImageData(backImageData, display.backImage.width), 0, 0);
     display.ctx.drawImage(display.backCtx.canvas, 0, 0, display.ctx.canvas.width, display.ctx.canvas.height);
 }
-function cullAndSortSprites(camera, spritePool, visibleSprites) {
-    const sp = new Vector2();
-    const dir = new Vector2().setPolar(camera.direction);
-    const fov = camera.fovRight.clone().sub(camera.fovLeft);
-    visibleSprites.length = 0;
-    for (let i = 0; i < spritePool.length; ++i) {
-        const sprite = spritePool.items[i];
-        sp.copy(sprite.position).sub(camera.position);
-        const spl = sp.length();
-        if (spl <= NEAR_CLIPPING_PLANE)
-            continue;
-        if (spl >= FAR_CLIPPING_PLANE)
-            continue;
-        const cos = sp.dot(dir) / spl;
-        if (cos < 0)
-            continue;
-        sprite.dist = NEAR_CLIPPING_PLANE / cos;
-        sp.norm().scale(sprite.dist).add(camera.position).sub(camera.fovLeft);
-        sprite.t = sp.length() / fov.length() * Math.sign(sp.dot(fov));
-        sprite.pdist = sprite.position.clone().sub(camera.position).dot(dir);
-        if (sprite.pdist < NEAR_CLIPPING_PLANE)
-            continue;
-        if (sprite.pdist >= FAR_CLIPPING_PLANE)
-            continue;
-        visibleSprites.push(sprite);
-    }
-    visibleSprites.sort((a, b) => b.pdist - a.pdist);
-}
-function renderSprites(display, sprites) {
-    for (let sprite of sprites) {
-        const cx = display.backImageData.width * sprite.t;
-        const cy = display.backImageData.height * 0.5;
-        const maxSpriteSize = display.backImageData.height / sprite.pdist;
-        const spriteSize = maxSpriteSize * sprite.scale;
-        const x1 = Math.floor(cx - spriteSize * 0.5);
-        const x2 = Math.floor(x1 + spriteSize - 1);
-        const bx1 = Math.max(0, x1);
-        const bx2 = Math.min(display.backImageData.width - 1, x2);
-        const y1 = Math.floor(cy + maxSpriteSize * 0.5 - maxSpriteSize * sprite.z);
-        const y2 = Math.floor(y1 + spriteSize - 1);
-        const by1 = Math.max(0, y1);
-        const by2 = Math.min(display.backImageData.height - 1, y2);
-        if (sprite.image instanceof ImageData) {
-            const src = sprite.image.data;
-            const dest = display.backImageData.data;
-            for (let x = bx1; x <= bx2; ++x) {
-                if (sprite.pdist < display.zBuffer[x]) {
-                    for (let y = by1; y <= by2; ++y) {
-                        const tx = Math.floor((x - x1) / spriteSize * sprite.cropSize.x);
-                        const ty = Math.floor((y - y1) / spriteSize * sprite.cropSize.y);
-                        const srcP = ((ty + sprite.cropPosition.y) * sprite.image.width + (tx + sprite.cropPosition.x)) * 4;
-                        const destP = (y * display.backImageData.width + x) * 4;
-                        const alpha = src[srcP + 3] / 255;
-                        dest[destP + 0] = dest[destP + 0] * (1 - alpha) + src[srcP + 0] * alpha;
-                        dest[destP + 1] = dest[destP + 1] * (1 - alpha) + src[srcP + 1] * alpha;
-                        dest[destP + 2] = dest[destP + 2] * (1 - alpha) + src[srcP + 2] * alpha;
-                    }
-                }
-            }
-        }
-        else if (sprite.image instanceof RGBA) {
-            const dest = display.backImageData.data;
-            for (let x = bx1; x <= bx2; ++x) {
-                if (sprite.pdist < display.zBuffer[x]) {
-                    for (let y = by1; y <= by2; ++y) {
-                        const destP = (y * display.backImageData.width + x) * 4;
-                        const alpha = sprite.image.a;
-                        dest[destP + 0] = dest[destP + 0] * (1 - alpha) + sprite.image.r * 255 * alpha;
-                        dest[destP + 1] = dest[destP + 1] * (1 - alpha) + sprite.image.g * 255 * alpha;
-                        dest[destP + 2] = dest[destP + 2] * (1 - alpha) + sprite.image.b * 255 * alpha;
-                    }
-                }
-            }
-        }
-    }
-}
-function pushSprite(spritePool, image, position, z, scale, cropPosition, cropSize) {
-    if (spritePool.length >= spritePool.items.length) {
-        spritePool.items.push({
-            image,
-            position: new Vector2(),
-            z,
-            scale,
-            pdist: 0,
-            dist: 0,
-            t: 0,
-            cropPosition: new Vector2(),
-            cropSize: new Vector2(),
-        });
-    }
-    const last = spritePool.length;
-    spritePool.items[last].image = image;
-    spritePool.items[last].position.copy(position);
-    spritePool.items[last].z = z;
-    spritePool.items[last].scale = scale;
-    spritePool.items[last].pdist = 0;
-    spritePool.items[last].dist = 0;
-    spritePool.items[last].t = 0;
-    if (image instanceof ImageData) {
-        if (cropPosition === undefined) {
-            spritePool.items[last].cropPosition.set(0, 0);
-        }
-        else {
-            spritePool.items[last].cropPosition.copy(cropPosition);
-        }
-        if (cropSize === undefined) {
-            spritePool.items[last]
-                .cropSize
-                .set(image.width, image.height)
-                .sub(spritePool.items[last].cropPosition);
-        }
-        else {
-            spritePool.items[last].cropSize.copy(cropSize);
-        }
+function pushSprite(wasmClient, spritePool, image, position, z, scale, cropPosition, cropSize) {
+    const cropPosition1 = new Vector2();
+    const cropSize1 = new Vector2();
+    if (cropPosition === undefined) {
+        cropPosition1.set(0, 0);
     }
     else {
-        spritePool.items[last].cropPosition.set(0, 0);
-        spritePool.items[last].cropSize.set(0, 0);
+        cropPosition1.copy(cropPosition);
     }
-    spritePool.length += 1;
+    if (cropSize === undefined) {
+        cropSize1.set(image.width, image.height).sub(cropPosition1);
+    }
+    else {
+        cropSize1.copy(cropSize);
+    }
+    wasmClient.push_sprite(spritePool.ptr, image.ptr, image.width, image.height, position.x, position.y, z, scale, cropPosition1.x, cropPosition1.y, cropSize1.x, cropSize1.y);
 }
 function updateCamera(player, camera) {
     const halfFov = FOV * 0.5;
     const fovLen = NEAR_CLIPPING_PLANE / Math.cos(halfFov);
     camera.position.copy(player.position);
-    camera.direction = player.direction;
+    camera.direction = properMod(player.direction, 2 * Math.PI);
     camera.fovLeft.setPolar(camera.direction - halfFov, fovLen).add(camera.position);
     camera.fovRight.setPolar(camera.direction + halfFov, fovLen).add(camera.position);
 }
 function spriteOfItemKind(itemKind, assets) {
     switch (itemKind) {
-        case common.ItemKind.Key: return assets.keyImageData;
-        case common.ItemKind.Bomb: return assets.bombImageData;
-        default: return assets.nullImageData;
+        case common.ItemKind.Key: return assets.keyImage;
+        case common.ItemKind.Bomb: return assets.bombImage;
+        default: return assets.nullImage;
     }
 }
-function updateItems(ws, spritePool, time, me, items, assets) {
+function updateItems(wasmClient, ws, spritePool, time, me, items, assets) {
     for (let item of items) {
         if (item.alive) {
-            pushSprite(spritePool, spriteOfItemKind(item.kind, assets), item.position, 0.25 + ITEM_AMP - ITEM_AMP * Math.sin(ITEM_FREQ * Math.PI * time + item.position.x + item.position.y), 0.25);
+            pushSprite(wasmClient, spritePool, spriteOfItemKind(item.kind, assets), item.position, 0.25 + ITEM_AMP - ITEM_AMP * Math.sin(ITEM_FREQ * Math.PI * time + item.position.x + item.position.y), 0.25);
         }
     }
     if (ws.readyState != WebSocket.OPEN) {
@@ -461,64 +142,11 @@ function updateItems(ws, spritePool, time, me, items, assets) {
         }
     }
 }
-function allocateParticles(capacity) {
-    let bomb = [];
-    for (let i = 0; i < capacity; ++i) {
-        bomb.push({
-            position: new Vector3(),
-            velocity: new Vector3(),
-            lifetime: 0,
-        });
-    }
-    return bomb;
+function updateParticles(wasmClient, assets, spritePool, deltaTime, scene, particlesPtr) {
+    wasmClient.update_particles(assets.particleImage.ptr, assets.particleImage.width, assets.particleImage.height, spritePool.ptr, deltaTime, scene.wallsPtr, scene.width, scene.height, particlesPtr);
 }
-function updateParticles(spritePool, deltaTime, scene, particles) {
-    for (let particle of particles) {
-        if (particle.lifetime > 0) {
-            particle.lifetime -= deltaTime;
-            particle.velocity.z -= common.BOMB_GRAVITY * deltaTime;
-            const nx = particle.position.x + particle.velocity.x * deltaTime;
-            const ny = particle.position.y + particle.velocity.y * deltaTime;
-            if (sceneGetTile(scene, new Vector2(nx, ny))) {
-                const dx = Math.abs(Math.floor(particle.position.x) - Math.floor(nx));
-                const dy = Math.abs(Math.floor(particle.position.y) - Math.floor(ny));
-                if (dx > 0)
-                    particle.velocity.x *= -1;
-                if (dy > 0)
-                    particle.velocity.y *= -1;
-                particle.velocity.scale(PARTICLE_DAMP);
-            }
-            else {
-                particle.position.x = nx;
-                particle.position.y = ny;
-            }
-            const nz = particle.position.z + particle.velocity.z * deltaTime;
-            if (nz < PARTICLE_SCALE || nz > 1.0) {
-                particle.velocity.z *= -1;
-                particle.velocity.scale(PARTICLE_DAMP);
-            }
-            else {
-                particle.position.z = nz;
-            }
-            if (particle.lifetime > 0) {
-                pushSprite(spritePool, PARTICLE_COLOR, new Vector2(particle.position.x, particle.position.y), particle.position.z, PARTICLE_SCALE);
-            }
-        }
-    }
-}
-function emitParticle(source, particles) {
-    for (let particle of particles) {
-        if (particle.lifetime <= 0) {
-            particle.lifetime = PARTICLE_LIFETIME;
-            particle.position.copy(source);
-            const angle = Math.random() * 2 * Math.PI;
-            particle.velocity.x = Math.cos(angle);
-            particle.velocity.y = Math.sin(angle);
-            particle.velocity.z = Math.random() * 0.5 + 0.5;
-            particle.velocity.scale(PARTICLE_MAX_SPEED * Math.random());
-            break;
-        }
-    }
+function emitParticle(wasmClient, source, particlesPtr) {
+    wasmClient.emit_particle(source.x, source.y, source.z, particlesPtr);
 }
 function playSound(sound, playerPosition, objectPosition) {
     const maxVolume = 1;
@@ -527,21 +155,21 @@ function playSound(sound, playerPosition, objectPosition) {
     sound.currentTime = 0;
     sound.play();
 }
-function explodeBomb(bomb, player, assets, particles) {
+function explodeBomb(wasmClient, bomb, player, assets, particlesPtr) {
     playSound(assets.bombBlastSound, player.position, bomb.position.clone2());
     for (let i = 0; i < BOMB_PARTICLE_COUNT; ++i) {
-        emitParticle(bomb.position, particles);
+        emitParticle(wasmClient, bomb.position, particlesPtr);
     }
 }
-function updateBombs(ws, spritePool, player, bombs, particles, scene, deltaTime, assets) {
+function updateBombs(wasmClient, ws, spritePool, player, bombs, particlesPtr, scene, deltaTime, assets) {
     for (let bomb of bombs) {
         if (bomb.lifetime > 0) {
-            pushSprite(spritePool, assets.bombImageData, new Vector2(bomb.position.x, bomb.position.y), bomb.position.z, common.BOMB_SCALE);
-            if (common.updateBomb(bomb, scene, deltaTime)) {
+            pushSprite(wasmClient, spritePool, assets.bombImage, new Vector2(bomb.position.x, bomb.position.y), bomb.position.z, common.BOMB_SCALE);
+            if (common.updateBomb(wasmClient, bomb, scene, deltaTime)) {
                 playSound(assets.bombRicochetSound, player.position, bomb.position.clone2());
             }
             if (ws.readyState != WebSocket.OPEN && bomb.lifetime <= 0) {
-                explodeBomb(bomb, player, assets, particles);
+                explodeBomb(wasmClient, bomb, player, assets, particlesPtr);
             }
         }
     }
@@ -554,39 +182,85 @@ async function loadImage(url) {
         image.onerror = reject;
     });
 }
-async function loadImageData(url) {
+class WasmImage {
+    ptr;
+    width;
+    height;
+    constructor(ptr, width, height) {
+        this.ptr = ptr;
+        this.width = width;
+        this.height = height;
+    }
+}
+async function loadWasmImage(wasmClient, url) {
     const image = await loadImage(url);
     const canvas = new OffscreenCanvas(image.width, image.height);
     const ctx = canvas.getContext("2d");
     if (ctx === null)
         throw new Error("2d canvas is not supported");
     ctx.drawImage(image, 0, 0);
-    return ctx.getImageData(0, 0, image.width, image.height);
+    const imageData = ctx.getImageData(0, 0, image.width, image.height);
+    const ptr = wasmClient.allocate_pixels(image.width, image.height);
+    new Uint8ClampedArray(wasmClient.memory.buffer, ptr, image.width * image.height * 4).set(imageData.data);
+    return new WasmImage(ptr, image.width, image.height);
+}
+async function instantiateWasmClient(url) {
+    const wasm = await WebAssembly.instantiateStreaming(fetch(url), {
+        "env": common.make_environment({
+            "fmodf": (x, y) => x % y,
+            "fminf": Math.min,
+            "fmaxf": Math.max,
+            "js_random": Math.random,
+        })
+    });
+    return {
+        wasm,
+        memory: wasm.instance.exports.memory,
+        _initialize: wasm.instance.exports._initialize,
+        allocate_scene: wasm.instance.exports.allocate_scene,
+        allocate_pixels: wasm.instance.exports.allocate_pixels,
+        allocate_zbuffer: wasm.instance.exports.allocate_zbuffer,
+        allocate_sprite_pool: wasm.instance.exports.allocate_sprite_pool,
+        reset_sprite_pool: wasm.instance.exports.reset_sprite_pool,
+        render_floor_and_ceiling: wasm.instance.exports.render_floor_and_ceiling,
+        render_column_of_wall: wasm.instance.exports.render_column_of_wall,
+        render_walls: wasm.instance.exports.render_walls,
+        render_minimap: wasm.instance.exports.render_minimap,
+        cull_and_sort_sprites: wasm.instance.exports.cull_and_sort_sprites,
+        push_sprite: wasm.instance.exports.push_sprite,
+        render_sprites: wasm.instance.exports.render_sprites,
+        allocate_particle_pool: wasm.instance.exports.allocate_particle_pool,
+        emit_particle: wasm.instance.exports.emit_particle,
+        update_particles: wasm.instance.exports.update_particles,
+    };
 }
 async function createGame() {
-    const [wallImageData, keyImageData, bombImageData, playerImageData, nullImageData] = await Promise.all([
-        loadImageData("assets/images/custom/wall.png"),
-        loadImageData("assets/images/custom/key.png"),
-        loadImageData("assets/images/custom/bomb.png"),
-        loadImageData("assets/images/custom/player.png"),
-        loadImageData("assets/images/custom/null.png"),
+    const wasmClient = await instantiateWasmClient("client.wasm");
+    wasmClient._initialize();
+    const [wallImage, keyImage, bombImage, playerImage, particleImage, nullImage,] = await Promise.all([
+        loadWasmImage(wasmClient, "assets/images/custom/wall.png"),
+        loadWasmImage(wasmClient, "assets/images/custom/key.png"),
+        loadWasmImage(wasmClient, "assets/images/custom/bomb.png"),
+        loadWasmImage(wasmClient, "assets/images/custom/player.png"),
+        loadWasmImage(wasmClient, "assets/images/custom/particle.png"),
+        loadWasmImage(wasmClient, "assets/images/custom/null.png"),
     ]);
     const itemPickupSound = new Audio("assets/sounds/bomb-pickup.ogg");
     const bombRicochetSound = new Audio("assets/sounds/ricochet.wav");
     const bombBlastSound = new Audio("assets/sounds/blast.ogg");
     const assets = {
-        wallImageData,
-        keyImageData,
-        bombImageData,
-        playerImageData,
-        nullImageData,
+        wallImage,
+        keyImage,
+        bombImage,
+        playerImage,
+        particleImage,
+        nullImage,
         bombRicochetSound,
         itemPickupSound,
         bombBlastSound,
     };
-    const particles = allocateParticles(1000);
-    const visibleSprites = [];
-    const spritePool = createSpritePool();
+    const particlesPtr = wasmClient.allocate_particle_pool();
+    const spritePool = createSpritePool(wasmClient);
     const players = new Map();
     const camera = {
         position: new Vector2(),
@@ -605,12 +279,12 @@ async function createGame() {
         moving: 0,
         hue: 0,
     };
-    const level = common.createLevel();
+    const level = common.createLevel(wasmClient);
     for (const item of level.items)
         item.alive = false;
     const game = {
-        camera, ws, me, ping: 0, players, particles, assets, spritePool, visibleSprites, dts: [],
-        level
+        camera, ws, me, ping: 0, players, particlesPtr, assets, spritePool, dts: [],
+        level, wasmClient
     };
     ws.binaryType = 'arraybuffer';
     ws.addEventListener("close", (event) => {
@@ -739,7 +413,7 @@ async function createGame() {
             game.level.bombs[index].position.x = common.BombExplodedStruct.x.read(view);
             game.level.bombs[index].position.y = common.BombExplodedStruct.y.read(view);
             game.level.bombs[index].position.z = common.BombExplodedStruct.z.read(view);
-            explodeBomb(level.bombs[index], me, assets, particles);
+            explodeBomb(wasmClient, level.bombs[index], me, assets, particlesPtr);
         }
         else {
             console.error("Received bogus-amogus message from server.", view);
@@ -755,29 +429,29 @@ function spriteAngleIndex(cameraPosition, entity) {
     return Math.floor(properMod(properMod(entity.direction, 2 * Math.PI) - properMod(entity.position.clone().sub(cameraPosition).angle(), 2 * Math.PI) - Math.PI + Math.PI / 8, 2 * Math.PI) / (2 * Math.PI) * SPRITE_ANGLES_COUNT);
 }
 function renderGame(display, deltaTime, time, game) {
-    resetSpritePool(game.spritePool);
+    game.wasmClient.reset_sprite_pool(game.spritePool.ptr);
     game.players.forEach((player) => {
         if (player !== game.me)
-            updatePlayer(player, game.level.scene, deltaTime);
+            updatePlayer(game.wasmClient, player, game.level.scene, deltaTime);
     });
-    updatePlayer(game.me, game.level.scene, deltaTime);
+    updatePlayer(game.wasmClient, game.me, game.level.scene, deltaTime);
     updateCamera(game.me, game.camera);
-    updateItems(game.ws, game.spritePool, time, game.me, game.level.items, game.assets);
-    updateBombs(game.ws, game.spritePool, game.me, game.level.bombs, game.particles, game.level.scene, deltaTime, game.assets);
-    updateParticles(game.spritePool, deltaTime, game.level.scene, game.particles);
+    updateItems(game.wasmClient, game.ws, game.spritePool, time, game.me, game.level.items, game.assets);
+    updateBombs(game.wasmClient, game.ws, game.spritePool, game.me, game.level.bombs, game.particlesPtr, game.level.scene, deltaTime, game.assets);
+    updateParticles(game.wasmClient, game.assets, game.spritePool, deltaTime, game.level.scene, game.particlesPtr);
     game.players.forEach((player) => {
         if (player !== game.me) {
             const index = spriteAngleIndex(game.camera.position, player);
-            pushSprite(game.spritePool, game.assets.playerImageData, player.position, 1, 1, new Vector2(55 * index, 0), new Vector2(55, 55));
+            pushSprite(game.wasmClient, game.spritePool, game.assets.playerImage, player.position, 1, 1, new Vector2(55 * index, 0), new Vector2(55, 55));
         }
     });
-    renderFloorAndCeiling(display.backImageData, game.camera);
-    renderWalls(display, game.assets, game.camera, game.level.scene);
-    cullAndSortSprites(game.camera, game.spritePool, game.visibleSprites);
-    renderSprites(display, game.visibleSprites);
-    displaySwapBackImageData(display);
+    game.wasmClient.render_floor_and_ceiling(display.backImage.ptr, display.backImage.width, display.backImage.height, game.camera.position.x, game.camera.position.y, game.camera.direction);
+    game.wasmClient.render_walls(display.backImage.ptr, display.backImage.width, display.backImage.height, display.zBufferPtr, game.assets.wallImage.ptr, game.assets.wallImage.width, game.assets.wallImage.height, game.camera.position.x, game.camera.position.y, game.camera.direction, game.level.scene.wallsPtr, game.level.scene.width, game.level.scene.height);
+    game.wasmClient.cull_and_sort_sprites(game.camera.position.x, game.camera.position.y, game.camera.direction, game.spritePool.ptr);
+    game.wasmClient.render_sprites(display.backImage.ptr, display.backImage.width, display.backImage.height, display.zBufferPtr, game.spritePool.ptr);
+    displaySwapBackImageData(display, game.wasmClient);
     if (MINIMAP)
-        renderMinimap(display.ctx, game.camera, game.me, game.level.scene, game.spritePool, game.visibleSprites);
+        renderMinimap(game.wasmClient, display, game.camera, game.me, game.level.scene, game.spritePool);
     renderDebugInfo(display.ctx, deltaTime, game);
 }
 (async () => {
@@ -791,8 +465,8 @@ function renderGame(display, deltaTime, time, game) {
     if (ctx === null)
         throw new Error("2D context is not supported");
     ctx.imageSmoothingEnabled = false;
-    const display = createDisplay(ctx, SCREEN_WIDTH, SCREEN_HEIGHT);
     const game = await createGame();
+    const display = createDisplay(ctx, game.wasmClient, SCREEN_WIDTH, SCREEN_HEIGHT);
     window.addEventListener("keydown", (e) => {
         if (!e.repeat) {
             const direction = CONTROL_KEYS[e.code];

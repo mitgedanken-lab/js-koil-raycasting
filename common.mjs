@@ -7,25 +7,6 @@ export const BOMB_THROW_VELOCITY = 5;
 export const BOMB_GRAVITY = 10;
 export const BOMB_DAMP = 0.8;
 export const BOMB_SCALE = 0.25;
-export class RGBA {
-    r;
-    g;
-    b;
-    a;
-    constructor(r, g, b, a) {
-        this.r = r;
-        this.g = g;
-        this.b = b;
-        this.a = a;
-    }
-    toStyle() {
-        return `rgba(`
-            + `${Math.floor(this.r * 255)}, `
-            + `${Math.floor(this.g * 255)}, `
-            + `${Math.floor(this.b * 255)}, `
-            + `${this.a})`;
-    }
-}
 export class Vector2 {
     x;
     y;
@@ -258,17 +239,6 @@ function allocUint8Field(allocator) {
         write: (view, value) => view.setUint8(offset, value)
     };
 }
-function allocUint16Field(allocator) {
-    const offset = allocator.size;
-    const size = UINT16_SIZE;
-    allocator.size += size;
-    return {
-        offset,
-        size,
-        read: (view) => view.getUint16(offset),
-        write: (view, value) => view.setUint16(offset, value)
-    };
-}
 function allocUint32Field(allocator) {
     const offset = allocator.size;
     const size = UINT32_SIZE;
@@ -451,38 +421,40 @@ export function clamp(value, min, max) {
 export function sceneContains(scene, p) {
     return 0 <= p.x && p.x < scene.width && 0 <= p.y && p.y < scene.height;
 }
-export function sceneGetTile(scene, p) {
+export function sceneGetTile(walls, scene, p) {
     if (!sceneContains(scene, p))
         return false;
-    return scene.walls[Math.floor(p.y) * scene.width + Math.floor(p.x)];
+    return walls[Math.floor(p.y) * scene.width + Math.floor(p.x)] !== 0;
 }
-export function sceneCanRectangleFitHere(scene, px, py, sx, sy) {
+export function sceneCanRectangleFitHere(wasmCommon, scene, px, py, sx, sy) {
     const x1 = Math.floor(px - sx * 0.5);
     const x2 = Math.floor(px + sx * 0.5);
     const y1 = Math.floor(py - sy * 0.5);
     const y2 = Math.floor(py + sy * 0.5);
+    const walls = new Uint8ClampedArray(wasmCommon.memory.buffer, scene.wallsPtr, scene.width * scene.height);
     for (let x = x1; x <= x2; ++x) {
         for (let y = y1; y <= y2; ++y) {
-            if (sceneGetTile(scene, new Vector2(x, y))) {
+            if (sceneGetTile(walls, scene, new Vector2(x, y))) {
                 return false;
             }
         }
     }
     return true;
 }
-export function createScene(walls) {
+export function createScene(walls, wasmCommon) {
     const scene = {
         height: walls.length,
         width: Number.MIN_VALUE,
-        walls: [],
+        wallsPtr: 0,
     };
     for (let row of walls) {
         scene.width = Math.max(scene.width, row.length);
     }
-    for (let row of walls) {
-        scene.walls = scene.walls.concat(row);
-        for (let i = 0; i < scene.width - row.length; ++i) {
-            scene.walls.push(false);
+    scene.wallsPtr = wasmCommon.allocate_scene(scene.width, scene.height);
+    const wallsData = new Uint8ClampedArray(wasmCommon.memory.buffer, scene.wallsPtr, scene.width * scene.height);
+    for (let y = 0; y < walls.length; ++y) {
+        for (let x = 0; x < walls[y].length; ++x) {
+            wallsData[y * scene.width + x] = Number(walls[y][x]);
         }
     }
     return scene;
@@ -527,13 +499,14 @@ export function throwBomb(player, bombs) {
     }
     return null;
 }
-export function updateBomb(bomb, scene, deltaTime) {
+export function updateBomb(wasmCommon, bomb, scene, deltaTime) {
     let collided = false;
     bomb.lifetime -= deltaTime;
     bomb.velocity.z -= BOMB_GRAVITY * deltaTime;
     const nx = bomb.position.x + bomb.velocity.x * deltaTime;
     const ny = bomb.position.y + bomb.velocity.y * deltaTime;
-    if (sceneGetTile(scene, new Vector2(nx, ny))) {
+    const walls = new Uint8ClampedArray(wasmCommon.memory.buffer, scene.wallsPtr, scene.width * scene.height);
+    if (sceneGetTile(walls, scene, new Vector2(nx, ny))) {
         const dx = Math.abs(Math.floor(bomb.position.x) - Math.floor(nx));
         const dy = Math.abs(Math.floor(bomb.position.y) - Math.floor(ny));
         if (dx > 0)
@@ -560,7 +533,7 @@ export function updateBomb(bomb, scene, deltaTime) {
     }
     return collided;
 }
-export function createLevel() {
+export function createLevel(wasmCommon) {
     const scene = createScene([
         [false, false, true, true, true, false, false],
         [false, false, false, false, false, true, false],
@@ -569,7 +542,7 @@ export function createLevel() {
         [true],
         [false, true, true, true, false, false, false],
         [false, false, false, false, false, false, false],
-    ]);
+    ], wasmCommon);
     const items = [
         {
             kind: ItemKind.Bomb,
@@ -605,7 +578,7 @@ export function createLevel() {
     const bombs = allocateBombs(20);
     return { scene, items, bombs };
 }
-export function updatePlayer(player, scene, deltaTime) {
+export function updatePlayer(wasmCommon, player, scene, deltaTime) {
     const controlVelocity = new Vector2();
     let angularVelocity = 0.0;
     if ((player.moving >> Moving.MovingForward) & 1) {
@@ -622,12 +595,26 @@ export function updatePlayer(player, scene, deltaTime) {
     }
     player.direction = player.direction + angularVelocity * deltaTime;
     const nx = player.position.x + controlVelocity.x * deltaTime;
-    if (sceneCanRectangleFitHere(scene, nx, player.position.y, PLAYER_SIZE, PLAYER_SIZE)) {
+    if (sceneCanRectangleFitHere(wasmCommon, scene, nx, player.position.y, PLAYER_SIZE, PLAYER_SIZE)) {
         player.position.x = nx;
     }
     const ny = player.position.y + controlVelocity.y * deltaTime;
-    if (sceneCanRectangleFitHere(scene, player.position.x, ny, PLAYER_SIZE, PLAYER_SIZE)) {
+    if (sceneCanRectangleFitHere(wasmCommon, scene, player.position.x, ny, PLAYER_SIZE, PLAYER_SIZE)) {
         player.position.y = ny;
     }
+}
+export function make_environment(...envs) {
+    return new Proxy(envs, {
+        get(_target, prop, _receiver) {
+            for (let env of envs) {
+                if (env.hasOwnProperty(prop)) {
+                    return env[prop];
+                }
+            }
+            return (...args) => {
+                throw new Error(`NOT IMPLEMENTED: ${String(prop)} ${args}`);
+            };
+        }
+    });
 }
 //# sourceMappingURL=common.mjs.map

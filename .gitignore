@@ -4,3 +4,7 @@ node_modules/
 .prettierignore
 tsconfig.tsbuildinfo
 *~
+<<<<<<< HEAD
+=======
+*.wat
+>>>>>>> 976c4fa07478e1dce63b0284d062fd3ff4d09ac7
