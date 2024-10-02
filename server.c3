@@ -1,10 +1,12 @@
 import std::io;
 import std::math;
 import std::collections::ringbuffer;
+import std::collections::list;
 import common;
 
-extern fn int js_now_secs();
-extern fn void js_write(void *buffer, usz buffer_sz);
+/// Stats //////////////////////////////
+
+extern fn int platform_now_secs();
 
 const usz AVERAGE_CAPACITY = 30;
 def Samples = RingBuffer(<float, AVERAGE_CAPACITY>);
@@ -139,7 +141,7 @@ fn String get_stat(Stat *stat) {
     switch (stat.kind) {
         case COUNTER: return string::tformat("%d", stat.counter.value);
         case AVERAGE: return string::tformat("%f", stat.average.samples.average());
-        case TIMER:   return display_time_interval(js_now_secs() - stat.timer.started_at);
+        case TIMER:   return display_time_interval(platform_now_secs() - stat.timer.started_at);
     }
 }
 
@@ -164,13 +166,10 @@ fn String display_time_interval(uint diffSecs) {
 
 fn void stats_print_per_n_ticks(int n) @extern("stats_print_per_n_ticks") @wasm {
     if (stats[StatEntry.TICKS_COUNT].counter.value%n == 0) {
-        @pool() {
-            io::printn(string::tformat("STARTED AT: %s", stats[StatEntry.UPTIME].timer.started_at));
-            io::printn("Stats:");
-            foreach (&stat: stats) {
-                io::printn(string::tformat("  %s %s", stat.description, get_stat(stat)));
-            }
-        };
+        io::printn("Stats:");
+        foreach (&stat: stats) {
+            io::printn(string::tformat("  %s %s", stat.description, get_stat(stat)));
+        }
     }
 }
 
@@ -188,14 +187,107 @@ fn void stats_inc_counter(StatEntry entry, int delta) @extern("stats_inc_counter
     stat.counter.value += delta;
 }
 
+/// Items //////////////////////////////
+
+List(<usz>) collected_items;
+
+fn void collect_items_by_player_at(float player_position_x, float player_position_y, Item[] *items) @extern("collect_items_by_player_at") @wasm {
+    foreach (item_index, item: *items) {
+        if (item.alive) {
+            if (common::collect_item(player_position_x, player_position_y, items, item_index)) {
+                collected_items.push(item_index);
+            }
+        }
+    }
+}
+
+fn ItemsCollectedBatchMessage *collected_items_as_batch_message(Item[]* items) @extern("collected_items_as_batch_message") @wasm {
+    if (collected_items.size == 0) return null;
+    int size = ItemsCollectedBatchMessage.sizeof + int.sizeof*collected_items.size;
+    ItemsCollectedBatchMessage *message = mem::tcalloc(size);
+    message.size = size;
+    message.kind = MessageKind.ITEM_COLLECTED;
+    for (int i = 0; i < collected_items.size; ++i) {
+        message.ids[i] = collected_items[i];
+    }
+    collected_items.size = 0;
+    return message;
+}
+
+/// Bombs //////////////////////////////
+
+List(<usz>) thrown_bombs;
+
+fn void throw_bomb_on_server_side(float player_position_x, float player_position_y, float player_direction, Bombs *bombs) @extern("throw_bomb_on_server_side") @wasm {
+    int index = common::throw_bomb(player_position_x, player_position_y, player_direction, bombs);
+    if (index >= 0) thrown_bombs.push(index);
+}
+
+fn BombsSpawnedBatchMessage *thrown_bombs_as_batch_message(Bombs *bombs) @extern("thrown_bombs_as_batch_message") @wasm {
+    if (thrown_bombs.size == 0) return null;
+    int size = BombsSpawnedBatchMessage.sizeof + BombSpawned.sizeof*thrown_bombs.size;
+    BombsSpawnedBatchMessage *message = mem::tcalloc(size);
+    message.size = size;
+    message.kind = MessageKind.BOMB_SPAWNED;
+
+    foreach (index, bombIndex: thrown_bombs) {
+        Bomb *bomb = &(*bombs)[bombIndex];
+        message.bombs[index].bombIndex = bombIndex;
+        message.bombs[index].x = bomb.position.x;
+        message.bombs[index].y = bomb.position.y;
+        message.bombs[index].z = bomb.position_z;
+        message.bombs[index].dx = bomb.velocity.x;
+        message.bombs[index].dy = bomb.velocity.y;
+        message.bombs[index].dz = bomb.velocity_z;
+        message.bombs[index].lifetime = bomb.lifetime;
+    }
+    thrown_bombs.size = 0;
+    return message;
+}
+
+List(<usz>) exploded_bombs;
+
+fn void update_bombs_on_server_side(Scene *scene, float delta_time, Bombs *bombs) @extern("update_bombs_on_server_side") @wasm {
+    foreach (bombIndex, &bomb: *bombs) {
+        if (bomb.lifetime > 0) {
+            common::update_bomb(bomb, scene, delta_time);
+            if (bomb.lifetime <= 0) {
+                exploded_bombs.push(bombIndex);
+            }
+        }
+    }
+}
+
+fn BombsExplodedBatchMessage* exploded_bombs_as_batch_message(Bombs* bombs) @extern("exploded_bombs_as_batch_message") @wasm {
+    if (exploded_bombs.size == 0) return null;
+    int size = BombsExplodedBatchMessage.sizeof + BombExploded.sizeof*exploded_bombs.size;
+    BombsExplodedBatchMessage *message = mem::tcalloc(size);
+    message.size = size;
+    message.kind = MessageKind.BOMB_EXPLODED;
+
+    foreach (index, bombIndex: exploded_bombs) {
+        Bomb bomb = (*bombs)[bombIndex];
+        message.bombs[index].bombIndex = bombIndex;
+        message.bombs[index].x         = bomb.position.x;
+        message.bombs[index].y         = bomb.position.y;
+        message.bombs[index].z         = bomb.position_z;
+    }
+
+    exploded_bombs.size = 0;
+    return message;
+}
+
+// Entry point //////////////////////////////
+
 fn void entry() @init(2048) @private {
     // NOTE: ideally we need to override os::native_fputc_fn as well
-    // because io::printn uses it print newline at the end of the
-    // message. But since js_write is implemented as a single
-    // console.log(), that newline is added implicitly anyway.
+    // because io::printn uses it to print newline at the end of the
+    // message. But since js_write() in server.mts is implemented as a
+    // single console.log(), that newline is added implicitly anyway.
     os::native_fwrite_fn = fn usz!(void* f, char[] buffer) {
-        js_write(&buffer[0], buffer.len);
+        common::platform_write(&buffer[0], buffer.len);
         return buffer.len;
     };
-    stats[StatEntry.UPTIME].timer.started_at = js_now_secs();
+    stats[StatEntry.UPTIME].timer.started_at = platform_now_secs();
+    common::temp_mark = allocator::temp().used;
 }

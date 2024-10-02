@@ -26,7 +26,6 @@ var StatEntry;
     StatEntry[StatEntry["COUNT"] = 16] = "COUNT";
 })(StatEntry || (StatEntry = {}));
 const wasmServer = await instantiateWasmServer('server.wasm');
-wasmServer._initialize();
 const players = new Map();
 const connectionLimits = new Map();
 let idCounter = 0;
@@ -38,7 +37,6 @@ const wss = new WebSocketServer({
 const joinedIds = new Set();
 const leftIds = new Set();
 const pingIds = new Map();
-const bombsThrown = new Set();
 const level = common.createLevel(wasmServer);
 wss.on("connection", (ws, req) => {
     ws.binaryType = 'arraybuffer';
@@ -104,10 +102,7 @@ wss.on("connection", (ws, req) => {
             }
         }
         else if (common.AmmaThrowingStruct.verify(view)) {
-            const index = common.throwBomb(player, level.bombs);
-            if (index !== null) {
-                bombsThrown.add(index);
-            }
+            wasmServer.throw_bomb_on_server_side(player.position.x, player.position.y, player.direction, level.bombsPtr);
         }
         else if (common.PingStruct.verify(view)) {
             pingIds.set(id, common.PingStruct.timestamp.read(view));
@@ -145,21 +140,26 @@ function tick() {
     let bytesSentCounter = 0;
     if (joinedIds.size > 0) {
         {
-            const count = players.size;
-            const buffer = new ArrayBuffer(common.PlayersJoinedHeaderStruct.size + count * common.PlayerStruct.size);
-            const headerView = new DataView(buffer, 0, common.PlayersJoinedHeaderStruct.size);
-            common.PlayersJoinedHeaderStruct.kind.write(headerView, common.MessageKind.PlayerJoined);
-            let index = 0;
-            players.forEach((player) => {
-                const playerView = new DataView(buffer, common.PlayersJoinedHeaderStruct.size + index * common.PlayerStruct.size);
-                common.PlayerStruct.id.write(playerView, player.id);
-                common.PlayerStruct.x.write(playerView, player.position.x);
-                common.PlayerStruct.y.write(playerView, player.position.y);
-                common.PlayerStruct.direction.write(playerView, player.direction);
-                common.PlayerStruct.hue.write(playerView, player.hue / 360 * 256);
-                common.PlayerStruct.moving.write(playerView, player.moving);
-                index += 1;
-            });
+            const playersCount = players.size;
+            const bufferPlayersState = common.PlayersJoinedHeaderStruct.allocateAndInit(playersCount);
+            {
+                let index = 0;
+                players.forEach((player) => {
+                    const playerView = common.PlayersJoinedHeaderStruct.item(bufferPlayersState, index);
+                    common.PlayerStruct.id.write(playerView, player.id);
+                    common.PlayerStruct.x.write(playerView, player.position.x);
+                    common.PlayerStruct.y.write(playerView, player.position.y);
+                    common.PlayerStruct.direction.write(playerView, player.direction);
+                    common.PlayerStruct.hue.write(playerView, player.hue / 360 * 256);
+                    common.PlayerStruct.moving.write(playerView, player.moving);
+                    index += 1;
+                });
+            }
+            const bufferItemsState = (() => {
+                const message = wasmServer.reconstruct_state_of_items(level.itemsPtr);
+                const size = new DataView(wasmServer.memory.buffer, message, common.UINT32_SIZE).getUint32(0, true);
+                return new Uint8ClampedArray(wasmServer.memory.buffer, message + common.UINT32_SIZE, size - common.UINT32_SIZE);
+            })();
             joinedIds.forEach((joinedId) => {
                 const joinedPlayer = players.get(joinedId);
                 if (joinedPlayer !== undefined) {
@@ -173,35 +173,23 @@ function tick() {
                     joinedPlayer.ws.send(view);
                     bytesSentCounter += view.byteLength;
                     messageSentCounter += 1;
-                    joinedPlayer.ws.send(buffer);
-                    bytesSentCounter += buffer.byteLength;
+                    joinedPlayer.ws.send(bufferPlayersState);
+                    bytesSentCounter += bufferPlayersState.byteLength;
                     messageSentCounter += 1;
-                    level.items.forEach((item, index) => {
-                        if (item.alive) {
-                            const view = new DataView(new ArrayBuffer(common.ItemSpawnedStruct.size));
-                            common.ItemSpawnedStruct.kind.write(view, common.MessageKind.ItemSpawned);
-                            common.ItemSpawnedStruct.index.write(view, index);
-                            common.ItemSpawnedStruct.x.write(view, item.position.x);
-                            common.ItemSpawnedStruct.y.write(view, item.position.y);
-                            common.ItemSpawnedStruct.itemKind.write(view, item.kind);
-                            joinedPlayer.ws.send(view);
-                            bytesSentCounter += view.byteLength;
-                            messageSentCounter += 1;
-                        }
-                    });
+                    joinedPlayer.ws.send(bufferItemsState);
+                    bytesSentCounter += bufferItemsState.byteLength;
+                    messageSentCounter += 1;
                 }
             });
         }
         {
             const count = joinedIds.size;
-            const buffer = new ArrayBuffer(common.PlayersJoinedHeaderStruct.size + count * common.PlayerStruct.size);
-            const headerView = new DataView(buffer, 0, common.PlayersJoinedHeaderStruct.size);
-            common.PlayersJoinedHeaderStruct.kind.write(headerView, common.MessageKind.PlayerJoined);
+            const buffer = common.PlayersJoinedHeaderStruct.allocateAndInit(count);
             let index = 0;
             joinedIds.forEach((joinedId) => {
                 const joinedPlayer = players.get(joinedId);
                 if (joinedPlayer !== undefined) {
-                    const playerView = new DataView(buffer, common.PlayersJoinedHeaderStruct.size + index * common.PlayerStruct.size);
+                    const playerView = common.PlayersJoinedHeaderStruct.item(buffer, index);
                     common.PlayerStruct.id.write(playerView, joinedPlayer.id);
                     common.PlayerStruct.x.write(playerView, joinedPlayer.position.x);
                     common.PlayerStruct.y.write(playerView, joinedPlayer.position.y);
@@ -222,15 +210,15 @@ function tick() {
     }
     if (leftIds.size > 0) {
         const count = leftIds.size;
-        const view = common.PlayersLeftHeaderStruct.allocateAndInit(count);
+        const buffer = common.PlayersLeftHeaderStruct.allocateAndInit(count);
         let index = 0;
         leftIds.forEach((leftId) => {
-            common.PlayersLeftHeaderStruct.items(index).id.write(view, leftId);
+            common.PlayersLeftHeaderStruct.item(buffer, index).setUint32(0, leftId, true);
             index += 1;
         });
         players.forEach((player) => {
-            player.ws.send(view);
-            bytesSentCounter += view.byteLength;
+            player.ws.send(buffer);
+            bytesSentCounter += buffer.byteLength;
             messageSentCounter += 1;
         });
     }
@@ -242,14 +230,12 @@ function tick() {
             }
         });
         if (count > 0) {
-            const buffer = new ArrayBuffer(common.PlayersMovingHeaderStruct.size + count * common.PlayerStruct.size);
-            const headerView = new DataView(buffer, 0, common.PlayersMovingHeaderStruct.size);
-            common.PlayersMovingHeaderStruct.kind.write(headerView, common.MessageKind.PlayerMoving);
+            const buffer = common.PlayersMovingHeaderStruct.allocateAndInit(count);
             let index = 0;
             players.forEach((player) => {
                 if (player.newMoving !== player.moving) {
                     player.moving = player.newMoving;
-                    const playerView = new DataView(buffer, common.PlayersMovingHeaderStruct.size + index * common.PlayerStruct.size);
+                    const playerView = common.PlayersMovingHeaderStruct.item(buffer, index);
                     common.PlayerStruct.id.write(playerView, player.id);
                     common.PlayerStruct.x.write(playerView, player.position.x);
                     common.PlayerStruct.y.write(playerView, player.position.y);
@@ -265,60 +251,53 @@ function tick() {
             });
         }
     }
-    bombsThrown.forEach((index) => {
-        const bomb = level.bombs[index];
-        const view = new DataView(new ArrayBuffer(common.BombSpawnedStruct.size));
-        common.BombSpawnedStruct.kind.write(view, common.MessageKind.BombSpawned);
-        common.BombSpawnedStruct.index.write(view, index);
-        common.BombSpawnedStruct.x.write(view, bomb.position.x);
-        common.BombSpawnedStruct.y.write(view, bomb.position.y);
-        common.BombSpawnedStruct.z.write(view, bomb.position.z);
-        common.BombSpawnedStruct.dx.write(view, bomb.velocity.x);
-        common.BombSpawnedStruct.dy.write(view, bomb.velocity.y);
-        common.BombSpawnedStruct.dz.write(view, bomb.velocity.z);
-        common.BombSpawnedStruct.lifetime.write(view, bomb.lifetime);
+    const bufferBombsThrown = (() => {
+        const message = wasmServer.thrown_bombs_as_batch_message(level.bombsPtr);
+        if (message === 0)
+            return null;
+        const size = new DataView(wasmServer.memory.buffer, message, common.UINT32_SIZE).getUint32(0, true);
+        return new Uint8ClampedArray(wasmServer.memory.buffer, message + common.UINT32_SIZE, size - common.UINT32_SIZE);
+    })();
+    if (bufferBombsThrown !== null) {
         players.forEach((player) => {
-            player.ws.send(view);
-            bytesSentCounter += view.byteLength;
+            player.ws.send(bufferBombsThrown);
+            bytesSentCounter += bufferBombsThrown.byteLength;
             messageSentCounter += 1;
         });
-    });
+    }
     {
         players.forEach((player) => {
-            common.updatePlayer(wasmServer, player, level.scene, deltaTime);
-            level.items.forEach((item, index) => {
-                if (item.alive) {
-                    if (common.collectItem(player, item)) {
-                        const view = new DataView(new ArrayBuffer(common.ItemCollectedStruct.size));
-                        common.ItemCollectedStruct.kind.write(view, common.MessageKind.ItemCollected);
-                        common.ItemCollectedStruct.index.write(view, index);
-                        players.forEach((anotherPlayer) => {
-                            anotherPlayer.ws.send(view);
-                            bytesSentCounter += view.byteLength;
-                            messageSentCounter += 1;
-                        });
-                    }
-                }
-            });
+            common.updatePlayer(wasmServer, player, level.scenePtr, deltaTime);
+            wasmServer.collect_items_by_player_at(player.position.x, player.position.y, level.itemsPtr);
         });
-        for (let index = 0; index < level.bombs.length; ++index) {
-            const bomb = level.bombs[index];
-            if (bomb.lifetime > 0) {
-                common.updateBomb(wasmServer, bomb, level.scene, deltaTime);
-                if (bomb.lifetime <= 0) {
-                    const view = new DataView(new ArrayBuffer(common.BombExplodedStruct.size));
-                    common.BombExplodedStruct.kind.write(view, common.MessageKind.BombExploded);
-                    common.BombExplodedStruct.index.write(view, index);
-                    common.BombExplodedStruct.x.write(view, bomb.position.x);
-                    common.BombExplodedStruct.y.write(view, bomb.position.y);
-                    common.BombExplodedStruct.z.write(view, bomb.position.z);
-                    players.forEach((player) => {
-                        player.ws.send(view);
-                        bytesSentCounter += view.byteLength;
-                        messageSentCounter += 1;
-                    });
-                }
-            }
+        const bufferItemsCollected = (() => {
+            const message = wasmServer.collected_items_as_batch_message(level.itemsPtr);
+            if (message === 0)
+                return null;
+            const size = new DataView(wasmServer.memory.buffer, message, common.UINT32_SIZE).getUint32(0, true);
+            return new Uint8ClampedArray(wasmServer.memory.buffer, message + common.UINT32_SIZE, size - common.UINT32_SIZE);
+        })();
+        if (bufferItemsCollected !== null) {
+            players.forEach((player) => {
+                player.ws.send(bufferItemsCollected);
+                bytesSentCounter += bufferItemsCollected.byteLength;
+                messageSentCounter += 1;
+            });
+        }
+        wasmServer.update_bombs_on_server_side(level.scenePtr, deltaTime, level.bombsPtr);
+        const bufferBombsExploded = (() => {
+            const message = wasmServer.exploded_bombs_as_batch_message(level.bombsPtr);
+            if (message === 0)
+                return null;
+            const size = new DataView(wasmServer.memory.buffer, message, common.UINT32_SIZE).getUint32(0, true);
+            return new Uint8ClampedArray(wasmServer.memory.buffer, message + common.UINT32_SIZE, size - common.UINT32_SIZE);
+        })();
+        if (bufferBombsExploded !== null) {
+            players.forEach((player) => {
+                player.ws.send(bufferBombsExploded);
+                bytesSentCounter += bufferBombsExploded.byteLength;
+                messageSentCounter += 1;
+            });
         }
     }
     pingIds.forEach((timestamp, id) => {
@@ -344,30 +323,37 @@ function tick() {
     joinedIds.clear();
     leftIds.clear();
     pingIds.clear();
-    bombsThrown.clear();
     bytesReceivedWithinTick = 0;
     messagesRecievedWithinTick = 0;
     wasmServer.stats_print_per_n_ticks(SERVER_FPS);
+    wasmServer.reset_temp_mark();
     setTimeout(tick, Math.max(0, 1000 / SERVER_FPS - tickTime));
 }
-function js_now_secs() {
+function platform_now_secs() {
     return Math.floor(Date.now() / 1000);
 }
-function js_write(buffer, buffer_len) {
+function platform_write(buffer, buffer_len) {
     console.log(new TextDecoder().decode(new Uint8ClampedArray(wasmServer.memory.buffer, buffer, buffer_len)));
 }
 async function instantiateWasmServer(path) {
     const wasm = await WebAssembly.instantiate(readFileSync(path), {
-        "env": { js_now_secs, js_write },
+        "env": { platform_now_secs, platform_write },
     });
+    const wasmCommon = common.makeWasmCommon(wasm);
+    wasmCommon._initialize();
     return {
-        wasm,
-        memory: wasm.instance.exports.memory,
-        _initialize: wasm.instance.exports._initialize,
-        allocate_scene: wasm.instance.exports.allocate_scene,
+        ...wasmCommon,
         stats_inc_counter: wasm.instance.exports.stats_inc_counter,
         stats_push_sample: wasm.instance.exports.stats_push_sample,
         stats_print_per_n_ticks: wasm.instance.exports.stats_print_per_n_ticks,
+        reconstruct_state_of_items: wasm.instance.exports.reconstruct_state_of_items,
+        collect_items_by_player_at: wasm.instance.exports.collect_items_by_player_at,
+        collected_items_as_batch_message: wasm.instance.exports.collected_items_as_batch_message,
+        throw_bomb: wasm.instance.exports.throw_bomb,
+        throw_bomb_on_server_side: wasm.instance.exports.throw_bomb_on_server_side,
+        thrown_bombs_as_batch_message: wasm.instance.exports.thrown_bombs_as_batch_message,
+        update_bombs_on_server_side: wasm.instance.exports.update_bombs_on_server_side,
+        exploded_bombs_as_batch_message: wasm.instance.exports.exploded_bombs_as_batch_message
     };
 }
 setTimeout(tick, 1000 / SERVER_FPS);

@@ -35,7 +35,6 @@ interface PlayerOnServer extends Player {
 }
 
 const wasmServer = await instantiateWasmServer('server.wasm');
-wasmServer._initialize();
 const players = new Map<number, PlayerOnServer>();
 const connectionLimits = new Map<string, number>();
 let idCounter = 0;
@@ -47,7 +46,6 @@ const wss = new WebSocketServer({
 const joinedIds = new Set<number>()
 const leftIds = new Set<number>()
 const pingIds = new Map<number, number>()
-const bombsThrown = new Set<number>()
 const level = common.createLevel(wasmServer);
 
 wss.on("connection", (ws, req) => {
@@ -123,10 +121,7 @@ wss.on("connection", (ws, req) => {
                 player.newMoving &= ~(1<<direction);
             }
         } else if (common.AmmaThrowingStruct.verify(view)) {
-            const index = common.throwBomb(player, level.bombs);
-            if (index !== null) {
-                bombsThrown.add(index)
-            }
+            wasmServer.throw_bomb_on_server_side(player.position.x, player.position.y, player.direction, level.bombsPtr);
         } else if (common.PingStruct.verify(view)) {
             pingIds.set(id, common.PingStruct.timestamp.read(view));
         } else {
@@ -166,23 +161,29 @@ function tick() {
     if (joinedIds.size > 0) {
         // Initialize joined player
         {
-            const count = players.size;
-            const buffer = new ArrayBuffer(common.PlayersJoinedHeaderStruct.size + count*common.PlayerStruct.size);
-            const headerView = new DataView(buffer, 0, common.PlayersJoinedHeaderStruct.size);
-            common.PlayersJoinedHeaderStruct.kind.write(headerView, common.MessageKind.PlayerJoined);
+            // Reconstructing the state of the other players batch
+            const playersCount = players.size;
+            const bufferPlayersState = common.PlayersJoinedHeaderStruct.allocateAndInit(playersCount);
+            {
+                let index = 0;
+                players.forEach((player) => {
+                    const playerView = common.PlayersJoinedHeaderStruct.item(bufferPlayersState, index);
+                    common.PlayerStruct.id.write(playerView, player.id);
+                    common.PlayerStruct.x.write(playerView, player.position.x);
+                    common.PlayerStruct.y.write(playerView, player.position.y);
+                    common.PlayerStruct.direction.write(playerView, player.direction);
+                    common.PlayerStruct.hue.write(playerView, player.hue/360*256);
+                    common.PlayerStruct.moving.write(playerView, player.moving);
+                    index += 1;
+                })
+            }
 
-            // Reconstructing the state of the other players
-            let index = 0;
-            players.forEach((player) => {
-                const playerView = new DataView(buffer, common.PlayersJoinedHeaderStruct.size + index*common.PlayerStruct.size);
-                common.PlayerStruct.id.write(playerView, player.id);
-                common.PlayerStruct.x.write(playerView, player.position.x);
-                common.PlayerStruct.y.write(playerView, player.position.y);
-                common.PlayerStruct.direction.write(playerView, player.direction);
-                common.PlayerStruct.hue.write(playerView, player.hue/360*256);
-                common.PlayerStruct.moving.write(playerView, player.moving);
-                index += 1;
-            })
+            // Reconstructing the state of items batch
+            const bufferItemsState = (() => {
+                const message = wasmServer.reconstruct_state_of_items(level.itemsPtr);
+                const size = new DataView(wasmServer.memory.buffer, message, common.UINT32_SIZE).getUint32(0, true);
+                return new Uint8ClampedArray(wasmServer.memory.buffer, message + common.UINT32_SIZE, size - common.UINT32_SIZE);
+            })();
 
             // Greeting all the joined players and notifying them about other players
             joinedIds.forEach((joinedId) => {
@@ -201,24 +202,14 @@ function tick() {
                     messageSentCounter += 1
 
                     // Reconstructing the state of the other players
-                    joinedPlayer.ws.send(buffer);
-                    bytesSentCounter += buffer.byteLength;
+                    joinedPlayer.ws.send(bufferPlayersState);
+                    bytesSentCounter += bufferPlayersState.byteLength;
                     messageSentCounter += 1
 
                     // Reconstructing the state of items
-                    level.items.forEach((item, index) => {
-                        if (item.alive) {
-                            const view = new DataView(new ArrayBuffer(common.ItemSpawnedStruct.size));
-                            common.ItemSpawnedStruct.kind.write(view, common.MessageKind.ItemSpawned);
-                            common.ItemSpawnedStruct.index.write(view, index);
-                            common.ItemSpawnedStruct.x.write(view, item.position.x);
-                            common.ItemSpawnedStruct.y.write(view, item.position.y);
-                            common.ItemSpawnedStruct.itemKind.write(view, item.kind);
-                            joinedPlayer.ws.send(view);
-                            bytesSentCounter += view.byteLength;
-                            messageSentCounter += 1
-                        }
-                    });
+                    joinedPlayer.ws.send(bufferItemsState);
+                    bytesSentCounter += bufferItemsState.byteLength;
+                    messageSentCounter += 1
 
                     // TODO: Reconstructing the state of bombs
                 }
@@ -228,15 +219,13 @@ function tick() {
         // Notifying old player about who joined
         {
             const count = joinedIds.size;
-            const buffer = new ArrayBuffer(common.PlayersJoinedHeaderStruct.size + count*common.PlayerStruct.size);
-            const headerView = new DataView(buffer, 0, common.PlayersJoinedHeaderStruct.size);
-            common.PlayersJoinedHeaderStruct.kind.write(headerView, common.MessageKind.PlayerJoined);
+            const buffer = common.PlayersJoinedHeaderStruct.allocateAndInit(count);
 
             let index = 0;
             joinedIds.forEach((joinedId) => {
                 const joinedPlayer = players.get(joinedId);
                 if (joinedPlayer !== undefined) { // This should never happen, but we handling none existing ids for more robustness
-                    const playerView = new DataView(buffer, common.PlayersJoinedHeaderStruct.size + index*common.PlayerStruct.size);
+                    const playerView = common.PlayersJoinedHeaderStruct.item(buffer, index);
                     common.PlayerStruct.id.write(playerView, joinedPlayer.id);
                     common.PlayerStruct.x.write(playerView, joinedPlayer.position.x);
                     common.PlayerStruct.y.write(playerView, joinedPlayer.position.y);
@@ -260,15 +249,15 @@ function tick() {
     // Notifying about whom left
     if (leftIds.size > 0) {
         const count = leftIds.size;
-        const view = common.PlayersLeftHeaderStruct.allocateAndInit(count);
+        const buffer = common.PlayersLeftHeaderStruct.allocateAndInit(count);
         let index = 0;
         leftIds.forEach((leftId) => {
-            common.PlayersLeftHeaderStruct.items(index).id.write(view, leftId)
+            common.PlayersLeftHeaderStruct.item(buffer, index).setUint32(0, leftId, true);
             index += 1;
         })
         players.forEach((player) => {
-            player.ws.send(view);
-            bytesSentCounter += view.byteLength;
+            player.ws.send(buffer);
+            bytesSentCounter += buffer.byteLength;
             messageSentCounter += 1
         })
     }
@@ -282,15 +271,13 @@ function tick() {
             }
         })
         if (count > 0) {
-            const buffer = new ArrayBuffer(common.PlayersMovingHeaderStruct.size + count*common.PlayerStruct.size);
-            const headerView = new DataView(buffer, 0, common.PlayersMovingHeaderStruct.size);
-            common.PlayersMovingHeaderStruct.kind.write(headerView, common.MessageKind.PlayerMoving);
+            const buffer = common.PlayersMovingHeaderStruct.allocateAndInit(count);
 
             let index = 0;
             players.forEach((player) => {
                 if (player.newMoving !== player.moving) {
                     player.moving = player.newMoving;
-                    const playerView = new DataView(buffer, common.PlayersMovingHeaderStruct.size + index*common.PlayerStruct.size);
+                    const playerView = common.PlayersMovingHeaderStruct.item(buffer, index);
                     common.PlayerStruct.id.write(playerView, player.id);
                     common.PlayerStruct.x.write(playerView, player.position.x);
                     common.PlayerStruct.y.write(playerView, player.position.y);
@@ -309,63 +296,57 @@ function tick() {
     }
 
     // Notifying about thrown bombs
-    bombsThrown.forEach((index) => {
-        const bomb = level.bombs[index];
-        const view = new DataView(new ArrayBuffer(common.BombSpawnedStruct.size));
-        common.BombSpawnedStruct.kind.write(view, common.MessageKind.BombSpawned);
-        common.BombSpawnedStruct.index.write(view, index);
-        common.BombSpawnedStruct.x.write(view, bomb.position.x);
-        common.BombSpawnedStruct.y.write(view, bomb.position.y);
-        common.BombSpawnedStruct.z.write(view, bomb.position.z);
-        common.BombSpawnedStruct.dx.write(view, bomb.velocity.x);
-        common.BombSpawnedStruct.dy.write(view, bomb.velocity.y);
-        common.BombSpawnedStruct.dz.write(view, bomb.velocity.z);
-        common.BombSpawnedStruct.lifetime.write(view, bomb.lifetime);
+    const bufferBombsThrown = (() => {
+        const message = wasmServer.thrown_bombs_as_batch_message(level.bombsPtr);
+        if (message === 0) return null;
+        const size = new DataView(wasmServer.memory.buffer, message, common.UINT32_SIZE).getUint32(0, true);
+        return new Uint8ClampedArray(wasmServer.memory.buffer, message + common.UINT32_SIZE, size - common.UINT32_SIZE);
+    })();
+
+    if (bufferBombsThrown !== null) {
         players.forEach((player) => {
-            player.ws.send(view);
-            bytesSentCounter += view.byteLength;
+            player.ws.send(bufferBombsThrown);
+            bytesSentCounter += bufferBombsThrown.byteLength;
             messageSentCounter += 1;
         })
-    })
+    }
 
     // Simulating the world for one server tick.
     {
         players.forEach((player) => {
-            common.updatePlayer(wasmServer, player, level.scene, deltaTime)
-            level.items.forEach((item, index) => {
-                if (item.alive) {
-                    if (common.collectItem(player, item)) {
-                        const view = new DataView(new ArrayBuffer(common.ItemCollectedStruct.size));
-                        common.ItemCollectedStruct.kind.write(view, common.MessageKind.ItemCollected);
-                        common.ItemCollectedStruct.index.write(view, index);
-                        players.forEach((anotherPlayer) => {
-                            anotherPlayer.ws.send(view);
-                            bytesSentCounter += view.byteLength;
-                            messageSentCounter += 1;
-                        });
-                    }
-                }
-            })
+            common.updatePlayer(wasmServer, player, level.scenePtr, deltaTime);
+            wasmServer.collect_items_by_player_at(player.position.x, player.position.y, level.itemsPtr);
         });
 
-        for (let index = 0; index < level.bombs.length; ++index) {
-            const bomb = level.bombs[index];
-            if (bomb.lifetime > 0) {
-                common.updateBomb(wasmServer, bomb, level.scene, deltaTime);
-                if (bomb.lifetime <= 0) {
-                    const view = new DataView(new ArrayBuffer(common.BombExplodedStruct.size));
-                    common.BombExplodedStruct.kind.write(view, common.MessageKind.BombExploded);
-                    common.BombExplodedStruct.index.write(view, index);
-                    common.BombExplodedStruct.x.write(view, bomb.position.x);
-                    common.BombExplodedStruct.y.write(view, bomb.position.y);
-                    common.BombExplodedStruct.z.write(view, bomb.position.z);
-                    players.forEach((player) => {
-                        player.ws.send(view);
-                        bytesSentCounter += view.byteLength;
-                        messageSentCounter += 1;
-                    })
-                }
-            }
+        const bufferItemsCollected = (() => {
+            const message = wasmServer.collected_items_as_batch_message(level.itemsPtr);
+            if (message === 0) return null;
+            const size = new DataView(wasmServer.memory.buffer, message, common.UINT32_SIZE).getUint32(0, true);
+            return new Uint8ClampedArray(wasmServer.memory.buffer, message + common.UINT32_SIZE, size - common.UINT32_SIZE);
+        })();
+
+        if (bufferItemsCollected !== null) {
+            players.forEach((player) => {
+                player.ws.send(bufferItemsCollected);
+                bytesSentCounter += bufferItemsCollected.byteLength;
+                messageSentCounter += 1;
+            });
+        }
+
+        wasmServer.update_bombs_on_server_side(level.scenePtr, deltaTime, level.bombsPtr);
+        const bufferBombsExploded = (() => {
+            const message = wasmServer.exploded_bombs_as_batch_message(level.bombsPtr);
+            if (message === 0) return null;
+            const size = new DataView(wasmServer.memory.buffer, message, common.UINT32_SIZE).getUint32(0, true);
+            return new Uint8ClampedArray(wasmServer.memory.buffer, message + common.UINT32_SIZE, size - common.UINT32_SIZE);
+        })();
+        
+        if (bufferBombsExploded !== null) {
+            players.forEach((player) => {
+                player.ws.send(bufferBombsExploded);
+                bytesSentCounter += bufferBombsExploded.byteLength;
+                messageSentCounter += 1;
+            })
         }
     }
 
@@ -395,13 +376,13 @@ function tick() {
     joinedIds.clear();
     leftIds.clear();
     pingIds.clear();
-    bombsThrown.clear();
     bytesReceivedWithinTick = 0;
     messagesRecievedWithinTick = 0;
 
     // TODO: serve the stats over a separate websocket, so a separate html page can poll it once in a while
     wasmServer.stats_print_per_n_ticks(SERVER_FPS);
 
+    wasmServer.reset_temp_mark();
     setTimeout(tick, Math.max(0, 1000/SERVER_FPS - tickTime));
 }
 
@@ -409,32 +390,47 @@ interface WasmServer extends common.WasmCommon {
     stats_inc_counter: (entry: number, delta: number) => void,
     stats_push_sample: (entry: number, sample: number) => void,
     stats_print_per_n_ticks: (n: number) => void,
+    reconstruct_state_of_items: (items: number) => number,
+    collect_items_by_player_at: (player_position_x: number, player_position_y: number, items: number) => void,
+    collected_items_as_batch_message: (items: number) => number,
+    throw_bomb: (player_position_x: number, player_position_y: number, player_direction: number, bombs: number) => number,
+    throw_bomb_on_server_side: (player_position_x: number, player_position_y: number, player_direction: number, bombs: number) => number,
+    thrown_bombs_as_batch_message: (bombs: number) => number,
+    update_bombs_on_server_side: (scene: number, delta_time: number, bombs: number) => void,
+    exploded_bombs_as_batch_message: (bombs: number) => number,
 }
 
-function js_now_secs(): number {
+function platform_now_secs(): number {
     return Math.floor(Date.now()/1000);
 }
 
 // NOTE: This implicitly adds newline, but given how we using this
-// function in server.c3 it's actually fine. It's called once per
-// io::printn().
-function js_write(buffer: number, buffer_len: number) {
+// function in server.c3 it's actually fine. This function is called
+// once per io::printn() anyway.
+function platform_write(buffer: number, buffer_len: number) {
     console.log(new TextDecoder().decode(new Uint8ClampedArray(wasmServer.memory.buffer, buffer, buffer_len)));
 }
 
 async function instantiateWasmServer(path: string): Promise<WasmServer> {
     const wasm = await WebAssembly.instantiate(readFileSync(path), {
-        "env": {js_now_secs, js_write},
+        "env": {platform_now_secs, platform_write},
     });
+    const wasmCommon = common.makeWasmCommon(wasm);
+    wasmCommon._initialize();
     return {
-        wasm,
-        memory: wasm.instance.exports.memory as WebAssembly.Memory,
-        _initialize: wasm.instance.exports._initialize as () => void,
-        allocate_scene: wasm.instance.exports.allocate_scene as (width: number, height: number) => number,
+        ...wasmCommon,
         stats_inc_counter: wasm.instance.exports.stats_inc_counter as (entry: number) => void,
         stats_push_sample: wasm.instance.exports.stats_push_sample as (entry: number, sample: number) => void,
         stats_print_per_n_ticks: wasm.instance.exports.stats_print_per_n_ticks as (n: number) => void,
-    }
+        reconstruct_state_of_items: wasm.instance.exports.reconstruct_state_of_items as (items: number) => number,
+        collect_items_by_player_at: wasm.instance.exports.collect_items_by_player_at as (player_position_x: number, player_position_y: number, items: number) => void,
+        collected_items_as_batch_message: wasm.instance.exports.collected_items_as_batch_message as (items: number) => number,
+        throw_bomb: wasm.instance.exports.throw_bomb as (player_position_x: number, player_position_y: number, player_direction: number, bombs: number) => number,
+        throw_bomb_on_server_side: wasm.instance.exports.throw_bomb_on_server_side as (player_position_x: number, player_position_y: number, player_direction: number, bombs: number) => number,
+        thrown_bombs_as_batch_message: wasm.instance.exports.thrown_bombs_as_batch_message as (bombs: number) => number,
+        update_bombs_on_server_side: wasm.instance.exports.update_bombs_on_server_side as (scene: number, delta_time: number, bombs: number) => void,
+        exploded_bombs_as_batch_message: wasm.instance.exports.exploded_bombs_as_batch_message as (bombs: number) => number
+    };
 }
 
 setTimeout(tick, 1000/SERVER_FPS);
