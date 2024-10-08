@@ -7,18 +7,32 @@ const float BOMB_LIFETIME = 2;
 const float BOMB_THROW_VELOCITY = 5;
 const float BOMB_DAMP = 0.8;
 const float BOMB_SCALE = 0.25;
+const float PLAYER_SIZE = 0.5;
 const float PLAYER_RADIUS = 0.5;
+const float PLAYER_SPEED = 2;
 
 extern fn void platform_write(void *buffer, usz buffer_sz);
+extern fn float platform_atan2f(float y, float x);
 
 def Vector2 = float[<2>];
 def IVector2 = int[<2>];
 def Vector3 = float[<3>];
 def Vector4 = float[<4>];
 
+macro Vector2.angle(self) => platform_atan2f(self.y, self.x);
+// // TODO: math::atan2 is broken. Does not work with sprite_angle_index() properly.
+// // Investigate what's up and potentially report to C3.
+// macro Vector2.angle(self) => math::atan2(self.y, self.x);
+
+fn Vector2 from_polar(float angle, float len) {
+    return {math::cos(angle)*len, math::sin(angle)*len};
+}
+
+// It's such mod that proper_mod(-1, 100) === 99
+macro proper_mod(a, b) => (a%b + b)%b;
+
 /// Messages //////////////////////////////
 
-// IMPORTANT: This must be synchronized with the MessageKind in common.mts until it is fully rewritten in C3.
 enum MessageKind: char {
     HELLO,
     PLAYER_JOINED,
@@ -35,7 +49,7 @@ enum MessageKind: char {
 }
 
 struct Message @packed {
-    int size;
+    int size;                   // TODO: it should emphasized throughout "substructures" that size is in bytes
     char[*] bytes;
 }
 
@@ -55,7 +69,9 @@ fn Scene *allocate_scene(usz width, usz height) {
     return scene;
 }
 
-fn Scene *allocate_default_scene() @extern("allocate_default_scene") @wasm {
+Scene *scene = null;
+
+fn Scene *allocate_default_scene() {
     bool[*][*] default_walls = {
         { false, false, true, true, true, false, false},
         { false, false, false, false, false, true, false},
@@ -76,14 +92,14 @@ fn Scene *allocate_default_scene() @extern("allocate_default_scene") @wasm {
     return scene;
 }
 
-fn bool Scene.get_tile(Scene *scene, Vector2 p) {
+fn bool Scene.get_tile(&scene, Vector2 p) {
     int x = (int)math::floor(p.x);
     int y = (int)math::floor(p.y);
     if (!(0 <= x && x < scene.width && 0 <= y && y < scene.height)) return false;
     return scene.walls[y*scene.width + x];
 }
 
-fn bool scene_can_rectangle_fit_here(Scene *scene, float px, float py, float sx, float sy) @extern("scene_can_rectangle_fit_here") @wasm {
+fn bool Scene.can_rectangle_fit_here(&scene, float px, float py, float sx, float sy) {
     int x1 = (int)math::floor(px - sx*0.5f);
     int x2 = (int)math::floor(px + sx*0.5f);
     int y1 = (int)math::floor(py - sy*0.5f);
@@ -144,10 +160,6 @@ Item[] items = {
     },
 };
 
-fn Item[]* allocate_items() @export("allocate_items") @wasm {
-    return &items;
-}
-
 fn bool collect_item(float player_position_x, float player_position_y, Item[] *items, usz item_index) @extern("collect_item") @wasm {
     if (item_index >= items.len) return false;
     Item *item = &(*items)[item_index];
@@ -170,11 +182,12 @@ struct ItemsSpawnedBatchMessage @packed {
     ItemSpawned[*] items;
 }
 
-fn ItemsSpawnedBatchMessage* reconstruct_state_of_items(Item[] *items) @extern("reconstruct_state_of_items") @wasm {
+fn ItemsSpawnedBatchMessage* reconstruct_state_of_items(Item[] *items) {
     usz itemsCount = 0;
     foreach (&item: *items) {
         if (item.alive) itemsCount += 1;
     }
+    if (itemsCount == 0) return null;
     int size = ItemsSpawnedBatchMessage.sizeof + ItemSpawned.sizeof*itemsCount;
     ItemsSpawnedBatchMessage *message = mem::tcalloc(size);
     message.size = size;
@@ -211,20 +224,19 @@ struct Bomb {
 }
 
 def Bombs = Bomb[20];
+Bombs bombs;
 
 fn Bombs* allocate_bombs() @extern("allocate_bombs") @wasm {
     return mem::new(Bombs);
 }
 
-fn int throw_bomb(float player_position_x, float player_position_y, float player_direction, Bombs *bombs) @extern("throw_bomb") @wasm {
+fn int throw_bomb(Vector2 position, float direction, Bombs *bombs) {
     foreach (index, &bomb: *bombs) {
         if (bomb.lifetime <= 0) {
             bomb.lifetime    = BOMB_LIFETIME;
-            bomb.position.x  = player_position_x;
-            bomb.position.y  = player_position_y;
+            bomb.position    = position;
             bomb.position_z  = 0.6;
-            bomb.velocity.x  = math::cos(player_direction);
-            bomb.velocity.y  = math::sin(player_direction);
+            bomb.velocity    = from_polar(direction, 1.0f);
             bomb.velocity_z  = 0.5;
             bomb.velocity   *= BOMB_THROW_VELOCITY;
             bomb.velocity_z *= BOMB_THROW_VELOCITY;
@@ -296,10 +308,118 @@ struct BombsExplodedBatchMessage @packed {
     BombExploded[*] bombs;
 }
 
+/// Player //////////////////////////////
+
+enum Moving: char {
+    MOVING_FORWARD,
+    MOVING_BACKWARD,
+    TURNING_LEFT,
+    TURNING_RIGHT,
+    COUNT,
+}
+
+struct Player {
+    uint id;
+    Vector2 position;
+    float direction;
+    char moving;
+    char hue;
+}
+
+// NOTE: this struct intended to be part of the binary protocol to communicate the state of the player.
+// This is why it is @packed. Do not confuse it with struct Player which is used to track the state of the player.
+struct PlayerStruct @packed {
+    uint id;
+    float x;
+    float y;
+    float direction;
+    char hue;
+    char moving;
+}
+
+struct PlayersJoinedBatchMessage @packed {
+    int size;
+    MessageKind kind;
+    PlayerStruct[*] players;
+}
+
+struct PlayersLeftBatchMessage @packed {
+    int size;
+    MessageKind kind;
+    uint[*] ids;
+}
+
+struct PlayersMovingBatchMessage @packed {
+    int size;
+    MessageKind kind;
+    PlayerStruct[*] players;
+}
+
+struct HelloMessage @packed {
+    int size;
+    MessageKind kind;
+    uint id;
+    float x;
+    float y;
+    float direction;
+    char hue;
+}
+
+struct PongMessage @packed {
+    int size;
+    MessageKind kind;
+    uint timestamp;
+}
+
+struct AmmaMovingMessage @packed {
+    int size;
+    MessageKind kind;
+    Moving direction;
+    char start;
+}
+
+struct AmmaThrowingMessage @packed {
+    int size;
+    MessageKind kind;
+}
+
+struct PingMessage {
+    int size;
+    MessageKind kind;
+    uint timestamp;
+}
+
+fn void update_player(Player *player, Scene *scene, float delta_time) {
+    Vector2 control_velocity = {0, 0};
+    float angular_velocity = 0.0;
+    if ((player.moving>>(uint)Moving.MOVING_FORWARD)&1) {
+        control_velocity += from_polar(player.direction, PLAYER_SPEED);
+    }
+    if ((player.moving>>(uint)Moving.MOVING_BACKWARD)&1) {
+        control_velocity -= from_polar(player.direction, PLAYER_SPEED);
+    }
+    if ((player.moving>>(uint)Moving.TURNING_LEFT)&1) {
+        angular_velocity -= math::PI;
+    }
+    if ((player.moving>>(uint)Moving.TURNING_RIGHT)&1) {
+        angular_velocity += math::PI;
+    }
+    player.direction = (player.direction + angular_velocity*delta_time)%(2*(float)math::PI);
+
+    float nx = player.position.x + control_velocity.x*delta_time;
+    if (scene.can_rectangle_fit_here(nx, player.position.y, PLAYER_SIZE, PLAYER_SIZE)) {
+        player.position.x = nx;
+    }
+    float ny = player.position.y + control_velocity.y*delta_time;
+    if (scene.can_rectangle_fit_here(player.position.x, ny, PLAYER_SIZE, PLAYER_SIZE)) {
+        player.position.y = ny;
+    }
+}
+
 /// Temporary Memory //////////////////////////////
 
 usz temp_mark = 0;
-fn void reset_temp_mark() @extern("reset_temp_mark") @wasm {
+fn void reset_temp_mark() {
     allocator::temp().reset(temp_mark);
 }
 

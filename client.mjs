@@ -1,24 +1,12 @@
 import * as common from './common.mjs';
-import { Vector2, updatePlayer, SERVER_PORT, clamp, properMod } from './common.mjs';
-const PING_COOLDOWN = 60;
-const NEAR_CLIPPING_PLANE = 0.1;
-const FOV = Math.PI * 0.5;
+import { SERVER_PORT } from './common.mjs';
 const SCREEN_FACTOR = 30;
 const SCREEN_WIDTH = Math.floor(16 * SCREEN_FACTOR);
 const SCREEN_HEIGHT = Math.floor(9 * SCREEN_FACTOR);
-const MINIMAP = false;
-const SPRITE_ANGLES_COUNT = 8;
-const CONTROL_KEYS = {
-    'ArrowLeft': common.Moving.TurningLeft,
-    'ArrowRight': common.Moving.TurningRight,
-    'ArrowUp': common.Moving.MovingForward,
-    'ArrowDown': common.Moving.MovingBackward,
-    'KeyA': common.Moving.TurningLeft,
-    'KeyD': common.Moving.TurningRight,
-    'KeyW': common.Moving.MovingForward,
-    'KeyS': common.Moving.MovingBackward,
-};
 let game;
+function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+}
 function renderDebugInfo(ctx, deltaTime, game) {
     const fontSize = 28;
     ctx.font = `${fontSize}px bold`;
@@ -36,8 +24,8 @@ function renderDebugInfo(ctx, deltaTime, game) {
             break;
         case WebSocket.OPEN:
             {
-                labels.push(`Ping: ${game.ping.toFixed(2)}ms`);
-                labels.push(`Players: ${game.players.size}`);
+                labels.push(`Ping: ${game.wasmClient.ping_msecs()}ms`);
+                labels.push(`Players: ${game.wasmClient.players_count()}`);
             }
             break;
         case WebSocket.CLOSING:
@@ -57,6 +45,7 @@ function renderDebugInfo(ctx, deltaTime, game) {
     }
 }
 function createDisplay(wasmClient, backImageWidth, backImageHeight) {
+    wasmClient.resize_display(backImageWidth, backImageHeight);
     const gameCanvas = document.getElementById("game");
     if (gameCanvas === null)
         throw new Error("No canvas with id `game` is found");
@@ -67,11 +56,6 @@ function createDisplay(wasmClient, backImageWidth, backImageHeight) {
     if (ctx === null)
         throw new Error("2D context is not supported");
     ctx.imageSmoothingEnabled = false;
-    const minimapWidth = backImageWidth * 0.03;
-    const minimapHeight = backImageHeight * 0.03;
-    const minimapPtr = wasmClient.allocate_image(minimapWidth, minimapHeight);
-    const backImagePtr = wasmClient.allocate_image(backImageWidth, backImageHeight);
-    const zBufferPtr = wasmClient.allocate_zbuffer(backImageWidth);
     const backCanvas = new OffscreenCanvas(backImageWidth, backImageHeight);
     const backCtx = backCanvas.getContext("2d");
     if (backCtx === null)
@@ -80,26 +64,15 @@ function createDisplay(wasmClient, backImageWidth, backImageHeight) {
     return {
         ctx,
         backCtx,
-        backImagePtr,
-        minimapPtr,
-        zBufferPtr,
     };
 }
 function displaySwapBackImageData(display, wasmClient) {
-    const backImagePixels = wasmClient.image_pixels(display.backImagePtr);
-    const backImageWidth = wasmClient.image_width(display.backImagePtr);
-    const backImageHeight = wasmClient.image_height(display.backImagePtr);
+    const backImageWidth = display.backCtx.canvas.width;
+    const backImageHeight = display.backCtx.canvas.height;
+    const backImagePixels = wasmClient.pixels_of_display();
     const backImageData = new Uint8ClampedArray(wasmClient.memory.buffer, backImagePixels, backImageWidth * backImageHeight * 4);
     display.backCtx.putImageData(new ImageData(backImageData, backImageWidth), 0, 0);
     display.ctx.drawImage(display.backCtx.canvas, 0, 0, display.ctx.canvas.width, display.ctx.canvas.height);
-}
-function updateCamera(player, camera) {
-    const halfFov = FOV * 0.5;
-    const fovLen = NEAR_CLIPPING_PLANE / Math.cos(halfFov);
-    camera.position.copy(player.position);
-    camera.direction = properMod(player.direction, 2 * Math.PI);
-    camera.fovLeft.setPolar(camera.direction - halfFov, fovLen).add(camera.position);
-    camera.fovRight.setPolar(camera.direction + halfFov, fovLen).add(camera.position);
 }
 async function loadImage(url) {
     const image = new Image();
@@ -133,6 +106,7 @@ async function instantiateWasmClient(url) {
             "fmodf": (x, y) => x % y,
             "fminf": Math.min,
             "fmaxf": Math.max,
+            "platform_atan2f": Math.atan2,
             "platform_random": Math.random,
             "platform_write": (buffer, buffer_len) => {
                 console.log(new TextDecoder().decode(new Uint8ClampedArray(game.wasmClient.memory.buffer, buffer, buffer_len)));
@@ -140,9 +114,9 @@ async function instantiateWasmClient(url) {
             "platform_is_offline_mode": () => game.ws.readyState != WebSocket.OPEN,
             "platform_play_sound": (sound, player_position_x, player_position_y, object_position_x, object_position_y) => {
                 const maxVolume = 1;
-                const objectPosition = new Vector2(object_position_x, object_position_y);
-                const playerPosition = new Vector2(player_position_x, player_position_y);
-                const distanceToPlayer = objectPosition.distanceTo(playerPosition);
+                const dx = player_position_x - object_position_x;
+                const dy = player_position_y - object_position_y;
+                const distanceToPlayer = Math.sqrt(dx * dx + dy * dy);
                 switch (sound) {
                     case AssetSound.BOMB_BLAST:
                         game.assets.bombBlastSound.volume = clamp(maxVolume / distanceToPlayer, 0.0, 1.0);
@@ -160,49 +134,36 @@ async function instantiateWasmClient(url) {
                         game.assets.itemPickupSound.play();
                         break;
                 }
-            }
+            },
+            platform_send_message: (message) => {
+                if (message === 0)
+                    return;
+                if (game.ws.readyState !== WebSocket.OPEN)
+                    return;
+                const size = new Uint32Array(game.wasmClient.memory.buffer, message, 1)[0];
+                if (size === 0)
+                    return;
+                game.ws.send(new Uint8Array(game.wasmClient.memory.buffer, message + common.UINT32_SIZE, size - common.UINT32_SIZE));
+            },
+            platform_now_msecs: () => performance.now(),
         }
     });
     const wasmCommon = common.makeWasmCommon(wasm);
     wasmCommon._initialize();
     return {
         ...wasmCommon,
-        allocate_zbuffer: wasm.instance.exports.allocate_zbuffer,
-        allocate_sprite_pool: wasm.instance.exports.allocate_sprite_pool,
-        reset_sprite_pool: wasm.instance.exports.reset_sprite_pool,
-        render_floor_and_ceiling: wasm.instance.exports.render_floor_and_ceiling,
-        render_walls: wasm.instance.exports.render_walls,
-        render_minimap: wasm.instance.exports.render_minimap,
-        cull_and_sort_sprites: wasm.instance.exports.cull_and_sort_sprites,
-        push_sprite: wasm.instance.exports.push_sprite,
-        render_sprites: wasm.instance.exports.render_sprites,
-        allocate_particle_pool: wasm.instance.exports.allocate_particle_pool,
-        emit_particle: wasm.instance.exports.emit_particle,
-        update_particles: wasm.instance.exports.update_particles,
-        kill_all_items: wasm.instance.exports.kill_all_items,
-        verify_items_collected_batch_message: wasm.instance.exports.verify_items_collected_batch_message,
-        apply_items_collected_batch_message_to_level_items: wasm.instance.exports.apply_items_collected_batch_message_to_level_items,
-        verify_items_spawned_batch_message: wasm.instance.exports.verify_items_spawned_batch_message,
-        apply_items_spawned_batch_message_to_level_items: wasm.instance.exports.apply_items_spawned_batch_message_to_level_items,
-        render_items: wasm.instance.exports.render_items,
-        verify_bombs_spawned_batch_message: wasm.instance.exports.verify_bombs_spawned_batch_message,
-        apply_bombs_spawned_batch_message_to_level_items: wasm.instance.exports.apply_bombs_spawned_batch_message_to_level_items,
-        verify_bombs_exploded_batch_message: wasm.instance.exports.verify_bombs_exploded_batch_message,
-        apply_bombs_exploded_batch_message_to_level_items: wasm.instance.exports.apply_bombs_exploded_batch_message_to_level_items,
-        update_bombs_on_client_side: wasm.instance.exports.update_bombs_on_client_side,
         allocate_image: wasm.instance.exports.allocate_image,
-        image_width: wasm.instance.exports.image_width,
-        image_height: wasm.instance.exports.image_height,
         image_pixels: wasm.instance.exports.image_pixels,
-        update_items: wasm.instance.exports.update_items,
+        players_count: wasm.instance.exports.players_count,
+        unregister_all_other_players: wasm.instance.exports.unregister_all_other_players,
+        key_down: wasm.instance.exports.key_down,
+        key_up: wasm.instance.exports.key_up,
+        render_game: wasm.instance.exports.render_game,
+        ping_msecs: wasm.instance.exports.ping_msecs,
+        process_message: wasm.instance.exports.process_message,
+        resize_display: wasm.instance.exports.resize_display,
+        pixels_of_display: wasm.instance.exports.pixels_of_display,
     };
-}
-function arrayBufferAsMessageInWasm(wasmClient, buffer) {
-    const wasmBufferSize = buffer.byteLength + common.UINT32_SIZE;
-    const wasmBufferPtr = wasmClient.allocate_temporary_buffer(wasmBufferSize);
-    new DataView(wasmClient.memory.buffer, wasmBufferPtr, common.UINT32_SIZE).setUint32(0, wasmBufferSize, true);
-    new Uint8ClampedArray(wasmClient.memory.buffer, wasmBufferPtr + common.UINT32_SIZE, wasmBufferSize - common.UINT32_SIZE).set(new Uint8ClampedArray(buffer));
-    return wasmBufferPtr;
 }
 async function createGame() {
     const wasmClient = await instantiateWasmClient("client.wasm");
@@ -228,37 +189,16 @@ async function createGame() {
         itemPickupSound,
         bombBlastSound,
     };
-    const particlesPtr = wasmClient.allocate_particle_pool();
-    const spritePoolPtr = wasmClient.allocate_sprite_pool();
-    const players = new Map();
-    const camera = {
-        position: new Vector2(),
-        direction: 0,
-        fovLeft: new Vector2(),
-        fovRight: new Vector2(),
-    };
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${protocol}//${window.location.hostname}:${SERVER_PORT}`);
     if (window.location.hostname === 'tsoding.github.io')
         ws.close();
-    const me = {
-        id: 0,
-        position: new Vector2(),
-        direction: 0,
-        moving: 0,
-        hue: 0,
-    };
-    const level = common.createLevel(wasmClient);
-    wasmClient.kill_all_items(level.itemsPtr);
     const display = createDisplay(wasmClient, SCREEN_WIDTH, SCREEN_HEIGHT);
-    const game = {
-        camera, ws, me, ping: 0, players, particlesPtr, assets, spritePoolPtr, dts: [],
-        level, wasmClient, display
-    };
+    const game = { ws, assets, dts: [], wasmClient, display };
     ws.binaryType = 'arraybuffer';
     ws.addEventListener("close", (event) => {
         console.log("WEBSOCKET CLOSE", event);
-        game.players.clear();
+        game.wasmClient.unregister_all_other_players();
     });
     ws.addEventListener("error", (event) => {
         console.log("WEBSOCKET ERROR", event);
@@ -267,99 +207,12 @@ async function createGame() {
         if (!(event.data instanceof ArrayBuffer)) {
             console.error("Received bogus-amogus message from server. Expected binary data", event);
             ws?.close();
+            return;
         }
-        const eventDataPtr = arrayBufferAsMessageInWasm(wasmClient, event.data);
-        const view = new DataView(event.data);
-        if (common.HelloStruct.verify(view)) {
-            game.me = {
-                id: common.HelloStruct.id.read(view),
-                position: new Vector2(common.HelloStruct.x.read(view), common.HelloStruct.y.read(view)),
-                direction: common.HelloStruct.direction.read(view),
-                moving: 0,
-                hue: common.HelloStruct.hue.read(view) / 256 * 360,
-            };
-            players.set(game.me.id, game.me);
-        }
-        else if (common.PlayersJoinedHeaderStruct.verify(view)) {
-            const count = common.PlayersJoinedHeaderStruct.count(view);
-            for (let i = 0; i < count; ++i) {
-                const playerView = common.PlayersJoinedHeaderStruct.item(event.data, i);
-                const id = common.PlayerStruct.id.read(playerView);
-                const player = players.get(id);
-                if (player !== undefined) {
-                    player.position.x = common.PlayerStruct.x.read(playerView);
-                    player.position.y = common.PlayerStruct.y.read(playerView);
-                    player.direction = common.PlayerStruct.direction.read(playerView);
-                    player.moving = common.PlayerStruct.moving.read(playerView);
-                    player.hue = common.PlayerStruct.hue.read(playerView) / 256 * 360;
-                }
-                else {
-                    const x = common.PlayerStruct.x.read(playerView);
-                    const y = common.PlayerStruct.y.read(playerView);
-                    players.set(id, {
-                        id,
-                        position: new Vector2(x, y),
-                        direction: common.PlayerStruct.direction.read(playerView),
-                        moving: common.PlayerStruct.moving.read(playerView),
-                        hue: common.PlayerStruct.hue.read(playerView) / 256 * 360,
-                    });
-                }
-            }
-        }
-        else if (common.PlayersLeftHeaderStruct.verify(view)) {
-            const count = common.PlayersLeftHeaderStruct.count(view);
-            for (let i = 0; i < count; ++i) {
-                const id = common.PlayersLeftHeaderStruct.item(event.data, i).getUint32(0, true);
-                players.delete(id);
-            }
-        }
-        else if (common.PlayersMovingHeaderStruct.verify(view)) {
-            const count = common.PlayersMovingHeaderStruct.count(view);
-            for (let i = 0; i < count; ++i) {
-                const playerView = common.PlayersMovingHeaderStruct.item(event.data, i);
-                const id = common.PlayerStruct.id.read(playerView);
-                const player = players.get(id);
-                if (player === undefined) {
-                    console.error(`Received bogus-amogus message from server. We don't know anything about player with id ${id}`);
-                    ws?.close();
-                    return;
-                }
-                player.moving = common.PlayerStruct.moving.read(playerView);
-                player.position.x = common.PlayerStruct.x.read(playerView);
-                player.position.y = common.PlayerStruct.y.read(playerView);
-                player.direction = common.PlayerStruct.direction.read(playerView);
-            }
-        }
-        else if (common.PongStruct.verify(view)) {
-            game.ping = performance.now() - common.PongStruct.timestamp.read(view);
-        }
-        else if (wasmClient.verify_items_collected_batch_message(eventDataPtr)) {
-            if (!wasmClient.apply_items_collected_batch_message_to_level_items(eventDataPtr, game.level.itemsPtr, game.me.position.x, game.me.position.y)) {
-                ws?.close();
-                return;
-            }
-        }
-        else if (wasmClient.verify_items_spawned_batch_message(eventDataPtr)) {
-            if (!wasmClient.apply_items_spawned_batch_message_to_level_items(eventDataPtr, game.level.itemsPtr)) {
-                ws?.close();
-                return;
-            }
-        }
-        else if (wasmClient.verify_bombs_spawned_batch_message(eventDataPtr)) {
-            if (!wasmClient.apply_bombs_spawned_batch_message_to_level_items(eventDataPtr, game.level.bombsPtr)) {
-                ws?.close();
-                return;
-            }
-        }
-        else if (wasmClient.verify_bombs_exploded_batch_message(eventDataPtr)) {
-            if (!wasmClient.apply_bombs_exploded_batch_message_to_level_items(eventDataPtr, game.level.bombsPtr, game.me.position.x, game.me.position.y, game.particlesPtr)) {
-                ws?.close();
-                return;
-            }
-        }
-        else {
-            console.error("Received bogus-amogus message from server.", view);
+        const eventDataPtr = common.arrayBufferAsMessageInWasm(wasmClient, event.data);
+        if (!game.wasmClient.process_message(eventDataPtr)) {
             ws?.close();
+            return;
         }
     });
     ws.addEventListener("open", (event) => {
@@ -367,99 +220,24 @@ async function createGame() {
     });
     return game;
 }
-function spriteAngleIndex(cameraPosition, entity) {
-    return Math.floor(properMod(properMod(entity.direction, 2 * Math.PI) - properMod(entity.position.clone().sub(cameraPosition).angle(), 2 * Math.PI) - Math.PI + Math.PI / 8, 2 * Math.PI) / (2 * Math.PI) * SPRITE_ANGLES_COUNT);
-}
-function renderGame(display, deltaTime, time, game) {
-    game.wasmClient.reset_sprite_pool(game.spritePoolPtr);
-    game.players.forEach((player) => {
-        if (player !== game.me)
-            updatePlayer(game.wasmClient, player, game.level.scenePtr, deltaTime);
-    });
-    updatePlayer(game.wasmClient, game.me, game.level.scenePtr, deltaTime);
-    updateCamera(game.me, game.camera);
-    game.wasmClient.update_items(game.spritePoolPtr, time, game.me.position.x, game.me.position.y, game.level.itemsPtr, game.assets.keyImagePtr, game.assets.bombImagePtr);
-    game.wasmClient.update_bombs_on_client_side(game.spritePoolPtr, game.particlesPtr, game.assets.bombImagePtr, game.level.scenePtr, game.me.position.x, game.me.position.y, deltaTime, game.level.bombsPtr);
-    game.wasmClient.update_particles(game.assets.particleImagePtr, game.spritePoolPtr, deltaTime, game.level.scenePtr, game.particlesPtr);
-    game.players.forEach((player) => {
-        if (player !== game.me) {
-            const index = spriteAngleIndex(game.camera.position, player);
-            game.wasmClient.push_sprite(game.spritePoolPtr, game.assets.playerImagePtr, player.position.x, player.position.y, 1, 1, 55 * index, 0, 55, 55);
-        }
-    });
-    game.wasmClient.render_floor_and_ceiling(display.backImagePtr, game.camera.position.x, game.camera.position.y, game.camera.direction);
-    game.wasmClient.render_walls(display.backImagePtr, display.zBufferPtr, game.assets.wallImagePtr, game.camera.position.x, game.camera.position.y, game.camera.direction, game.level.scenePtr);
-    game.wasmClient.cull_and_sort_sprites(game.camera.position.x, game.camera.position.y, game.camera.direction, game.spritePoolPtr);
-    game.wasmClient.render_sprites(display.backImagePtr, display.zBufferPtr, game.spritePoolPtr);
-    displaySwapBackImageData(display, game.wasmClient);
-    if (MINIMAP)
-        game.wasmClient.render_minimap(display.minimapPtr, game.camera.position.x, game.camera.position.y, game.camera.direction, game.me.position.x, game.me.position.y, game.level.scenePtr, game.spritePoolPtr);
-    renderDebugInfo(display.ctx, deltaTime, game);
-}
 (async () => {
     game = await createGame();
     window.addEventListener("keydown", (e) => {
-        if (!e.repeat) {
-            const direction = CONTROL_KEYS[e.code];
-            if (direction !== undefined) {
-                if (game.ws.readyState === WebSocket.OPEN) {
-                    const view = new DataView(new ArrayBuffer(common.AmmaMovingStruct.size));
-                    common.AmmaMovingStruct.kind.write(view, common.MessageKind.AmmaMoving);
-                    common.AmmaMovingStruct.start.write(view, 1);
-                    common.AmmaMovingStruct.direction.write(view, direction);
-                    game.ws.send(view);
-                }
-                else {
-                    game.me.moving |= 1 << direction;
-                }
-            }
-            else if (e.code === 'Space') {
-                if (game.ws.readyState === WebSocket.OPEN) {
-                    const view = new DataView(new ArrayBuffer(common.AmmaThrowingStruct.size));
-                    common.AmmaThrowingStruct.kind.write(view, common.MessageKind.AmmaThrowing);
-                    game.ws.send(view);
-                }
-                else {
-                    game.wasmClient.throw_bomb(game.me.position.x, game.me.position.y, game.me.direction, game.level.bombsPtr);
-                }
-            }
-        }
+        if (!e.repeat)
+            game.wasmClient.key_down(e.keyCode);
     });
     window.addEventListener("keyup", (e) => {
-        if (!e.repeat) {
-            const direction = CONTROL_KEYS[e.code];
-            if (direction !== undefined) {
-                if (game.ws.readyState === WebSocket.OPEN) {
-                    const view = new DataView(new ArrayBuffer(common.AmmaMovingStruct.size));
-                    common.AmmaMovingStruct.kind.write(view, common.MessageKind.AmmaMoving);
-                    common.AmmaMovingStruct.start.write(view, 0);
-                    common.AmmaMovingStruct.direction.write(view, direction);
-                    game.ws.send(view);
-                }
-                else {
-                    game.me.moving &= ~(1 << direction);
-                }
-            }
-        }
+        if (!e.repeat)
+            game.wasmClient.key_up(e.keyCode);
     });
     let prevTimestamp = 0;
-    let pingCooldown = PING_COOLDOWN;
     const frame = (timestamp) => {
         const deltaTime = (timestamp - prevTimestamp) / 1000;
         const time = timestamp / 1000;
         prevTimestamp = timestamp;
-        renderGame(game.display, deltaTime, time, game);
-        if (game.ws.readyState == WebSocket.OPEN) {
-            pingCooldown -= 1;
-            if (pingCooldown <= 0) {
-                const view = new DataView(new ArrayBuffer(common.PingStruct.size));
-                common.PingStruct.kind.write(view, common.MessageKind.Ping);
-                common.PingStruct.timestamp.write(view, performance.now());
-                game.ws.send(view);
-                pingCooldown = PING_COOLDOWN;
-            }
-        }
-        game.wasmClient.reset_temp_mark();
+        game.wasmClient.render_game(game.assets.keyImagePtr, game.assets.bombImagePtr, game.assets.particleImagePtr, game.assets.wallImagePtr, game.assets.playerImagePtr, deltaTime, time);
+        displaySwapBackImageData(game.display, game.wasmClient);
+        renderDebugInfo(game.display.ctx, deltaTime, game);
         window.requestAnimationFrame(frame);
     };
     window.requestAnimationFrame((timestamp) => {
